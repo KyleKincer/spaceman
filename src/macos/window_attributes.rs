@@ -56,6 +56,57 @@ thread_local! {
         let names: Vec<_> = NAMES.iter().map(|name| CFString::from_static_str(name)).collect();
         CFArray::from_retained_objects(&names)
     };
+    static FRAME_NAME_ARRAY: CFRetained<CFArray<CFString>> = {
+        let names = [
+            CFString::from_static_str("AXPosition"),
+            CFString::from_static_str("AXSize"),
+        ];
+        CFArray::from_retained_objects(&names)
+    };
+}
+
+/// Read `AXPosition` and `AXSize` in one Accessibility round trip, falling back
+/// to individual attribute reads only if the app rejects the batch call.
+pub(super) fn read_frame(element: &AXUIElement) -> Option<Rect> {
+    let values = FRAME_NAME_ARRAY.with(|names| copy_multiple(element, names, 2));
+    let decode = |index: usize, name: &'static str| -> Option<CFRetained<AXValue>> {
+        match &values {
+            Values::Batch(batch) => {
+                let value = batch.get(index)?;
+                if value.downcast_ref::<CFNull>().is_some()
+                    || value
+                        .downcast_ref::<AXValue>()
+                        .and_then(embedded_error)
+                        .is_some()
+                {
+                    return None;
+                }
+                value.downcast::<AXValue>().ok()
+            }
+            Values::Failed(_) => None,
+            Values::Single => attribute::<AXValue>(element, name).ok(),
+        }
+    };
+    let pos_val = decode(0, "AXPosition")?;
+    let size_val = decode(1, "AXSize")?;
+    let mut position = CGPoint::ZERO;
+    let mut size = CGSize::ZERO;
+    // SAFETY: `position` and `size` match `CGPoint` / `CGSize` layouts on the stack.
+    let ok = unsafe {
+        pos_val.value(
+            AXValueType::CGPoint,
+            NonNull::from(&mut position).cast::<c_void>(),
+        ) && size_val.value(
+            AXValueType::CGSize,
+            NonNull::from(&mut size).cast::<c_void>(),
+        )
+    };
+    ok.then_some(Rect {
+        x: position.x.round() as i32,
+        y: position.y.round() as i32,
+        width: size.width.round() as i32,
+        height: size.height.round() as i32,
+    })
 }
 
 enum Values {
@@ -76,7 +127,7 @@ pub(super) struct WindowAttributes<'a> {
 
 impl<'a> WindowAttributes<'a> {
     pub(super) fn read(element: &'a AXUIElement) -> Self {
-        let values = NAME_ARRAY.with(|names| copy_multiple(element, names));
+        let values = NAME_ARRAY.with(|names| copy_multiple(element, names, NAMES.len()));
         Self { element, values }
     }
 
@@ -142,7 +193,7 @@ impl<'a> WindowAttributes<'a> {
     }
 }
 
-fn copy_multiple(element: &AXUIElement, names: &CFArray<CFString>) -> Values {
+fn copy_multiple(element: &AXUIElement, names: &CFArray<CFString>, expected_len: usize) -> Values {
     let mut raw: *const CFArray = ptr::null();
     // SAFETY: `names` is a valid array of `CFString`s and `raw` is writable stack storage that
     // receives a +1 retained `CFArrayRef` under the Core Foundation Copy rule. Options `0`
@@ -167,7 +218,7 @@ fn copy_multiple(element: &AXUIElement, names: &CFArray<CFString>) -> Values {
     // SAFETY: Accessibility returns an array of Core Foundation objects, so every element is a
     // `CFType`.
     let values = unsafe { CFRetained::cast_unchecked::<CFArray<CFType>>(values) };
-    if values.len() == NAMES.len() {
+    if values.len() == expected_len {
         Values::Batch(values)
     } else {
         Values::Single

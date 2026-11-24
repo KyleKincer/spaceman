@@ -593,19 +593,27 @@ fn observe_window(
         || attributes
             .optional_bool(WindowAttribute::FullScreen)
             .map_err(|error| format!("AXFullScreen: {error:?}"))?
-        || !is_settable(window, "AXPosition")
-            .map_err(|error| format!("AXPosition settable: {error:?}"))?
     {
         return Ok(WindowObservation::Ignored);
     }
 
-    let frame = attributes.frame().ok_or("AX frame was unavailable")?;
-    if frame.width < MIN_MANAGEABLE_WINDOW_DIMENSION
-        || frame.height < MIN_MANAGEABLE_WINDOW_DIMENSION
-        || !output.contains_center(frame)
+    // Parked and tiny windows already have their frame in the batched attribute
+    // read; filtering them before `is_settable("AXPosition")` skips a synchronous
+    // AX round trip per off-screen window on every observation cycle.
+    let maybe_frame = attributes.frame();
+    if let Some(frame) = maybe_frame
+        && (frame.width < MIN_MANAGEABLE_WINDOW_DIMENSION
+            || frame.height < MIN_MANAGEABLE_WINDOW_DIMENSION
+            || !output.contains_center(frame))
     {
         return Ok(WindowObservation::Ignored);
     }
+    if !is_settable(window, "AXPosition")
+        .map_err(|error| format!("AXPosition settable: {error:?}"))?
+    {
+        return Ok(WindowObservation::Ignored);
+    }
+    let frame = maybe_frame.ok_or("AX frame was unavailable")?;
     let close = attributes
         .get::<AXUIElement>(WindowAttribute::CloseButton)
         .is_ok();

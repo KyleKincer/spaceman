@@ -54,14 +54,7 @@ pub(super) fn set_size(window: &AXUIElement, frame: Rect) -> AXError {
 }
 
 pub(super) fn window_frame(window: &AXUIElement) -> Option<Rect> {
-    let position = ax_point(window, "AXPosition")?;
-    let size = ax_size(window, "AXSize")?;
-    Some(Rect {
-        x: position.x.round() as i32,
-        y: position.y.round() as i32,
-        width: size.width.round() as i32,
-        height: size.height.round() as i32,
-    })
+    super::window_attributes::read_frame(window)
 }
 
 pub(super) fn onscreen_windows() -> Option<HashMap<i32, HashMap<CGWindowID, i64>>> {
@@ -375,27 +368,4 @@ pub(super) fn set_attribute(element: &AXUIElement, name: &'static str, value: &C
 fn ax_value<T>(kind: AXValueType, mut value: T) -> Option<CFRetained<AXValue>> {
     // SAFETY: `value` matches the caller's `AXValueType` (`CGPoint` or `CGSize`) on the stack.
     unsafe { AXValue::new(kind, NonNull::from(&mut value).cast::<c_void>()) }
-}
-
-fn ax_value_get<T: Copy>(
-    element: &AXUIElement,
-    name: &'static str,
-    kind: AXValueType,
-    mut zero: T,
-) -> Option<T> {
-    let value = attribute::<AXValue>(element, name).ok()?;
-    // SAFETY: `zero` matches the layout expected by `kind` (`CGPoint` or `CGSize`).
-    unsafe {
-        value
-            .value(kind, NonNull::from(&mut zero).cast::<c_void>())
-            .then_some(zero)
-    }
-}
-
-fn ax_point(element: &AXUIElement, name: &'static str) -> Option<CGPoint> {
-    ax_value_get(element, name, AXValueType::CGPoint, CGPoint::ZERO)
-}
-
-fn ax_size(element: &AXUIElement, name: &'static str) -> Option<CGSize> {
-    ax_value_get(element, name, AXValueType::CGSize, CGSize::ZERO)
 }
