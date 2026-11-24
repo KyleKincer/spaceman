@@ -132,30 +132,35 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         workspace: WorkspaceId,
         observation: &mut crate::NativeObservation,
+        observed: &mut crate::model::FastHashMap<crate::PhysicalWindowId, crate::Rect>,
         onscreen_frames: &mut Option<Option<HashMap<u32, crate::Rect>>>,
         close_recheck: &mut Option<Instant>,
     ) {
         if observation.mouse_down {
             return;
         }
-        let bound = self.workspaces.engine(workspace).bound_windows();
-        if bound.is_empty() && self.omitted_windows.is_empty() {
+        let engine = self.workspaces.engine(workspace);
+        if engine.is_empty() && self.omitted_windows.is_empty() {
             return;
         }
-        let observed: HashSet<_> = live::observed_frames(observation).into_keys().collect();
-        self.omitted_windows
-            .retain(|window, _| match self.workspaces.workspace_of(window) {
-                Some(owner) => owner != workspace || !observed.contains(window),
-                // An omitted float's settle is tracked by affinity freezing.
-                None => self.workspaces.floating_workspace_of(window).is_some(),
-            });
+        if !self.omitted_windows.is_empty() {
+            self.omitted_windows
+                .retain(|window, _| match self.workspaces.workspace_of(window) {
+                    Some(owner) => owner != workspace || !observed.contains_key(window),
+                    // An omitted float's settle is tracked by affinity freezing.
+                    None => self.workspaces.floating_workspace_of(window).is_some(),
+                });
+        }
+        let engine = self.workspaces.engine(workspace);
         let has_missing_complete = observation.applications.iter().any(|app_observation| {
             let crate::AppObservation::Complete { app, .. } = app_observation else {
                 return false;
             };
-            bound
-                .iter()
-                .any(|window| window.app == app.id && !observed.contains(window))
+            engine.owns_app(&app.id)
+                && engine.model().workspace.slots.iter().any(|slot| {
+                    slot.bound_window()
+                        .is_some_and(|w| w.app == app.id && !observed.contains_key(w))
+                })
         });
         if !has_missing_complete {
             return;
@@ -166,14 +171,15 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         else {
             return;
         };
+        let bound = self.workspaces.engine(workspace).bound_windows();
         let now = Instant::now();
         for app_observation in &mut observation.applications {
-            let crate::AppObservation::Complete { app, .. } = app_observation else {
+            let crate::AppObservation::Complete { app, windows, .. } = app_observation else {
                 continue;
             };
             let settling = bound
                 .iter()
-                .filter(|window| window.app == app.id && !observed.contains(*window))
+                .filter(|window| window.app == app.id && !observed.contains_key(*window))
                 .filter(|window| onscreen_frames.contains_key(&window.window_id))
                 .filter(|window| {
                     let omission = self
@@ -199,6 +205,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             if settling == 0 {
                 continue;
             }
+            for w in windows.iter() {
+                observed.remove(&w.id);
+            }
             *app_observation = crate::AppObservation::Unavailable {
                 app: app.id.clone(),
                 error: format!(
@@ -221,6 +230,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         workspace: WorkspaceId,
         observation: &crate::NativeObservation,
+        observed: &crate::model::FastHashMap<crate::PhysicalWindowId, crate::Rect>,
         server_frames: Option<&HashMap<u32, crate::Rect>>,
         onscreen_frames: &mut Option<Option<HashMap<u32, crate::Rect>>>,
         close_recheck: &mut Option<Instant>,
@@ -229,36 +239,51 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let Some(server_frames) = server_frames else {
             return apps;
         };
-        let present: HashSet<_> = observation
-            .applications
-            .iter()
-            .map(|app| app.app_id().clone())
-            .collect();
-        let windows: Vec<_> = self
-            .workspaces
-            .engine(workspace)
-            .model()
-            .workspace
-            .slots
-            .iter()
-            .flat_map(|slot| match &slot.binding {
-                BindingState::Bound(window) => vec![(window.clone(), true)],
+        let engine = self.workspaces.engine(workspace);
+        if engine.is_empty() {
+            return apps;
+        }
+        let mut present: crate::model::FastHashSet<&AppInstanceId> =
+            crate::model::FastHashSet::with_capacity_and_hasher(
+                observation.applications.len(),
+                Default::default(),
+            );
+        for app in &observation.applications {
+            present.insert(app.app_id());
+        }
+        let mut windows = Vec::new();
+        for slot in &engine.model().workspace.slots {
+            match &slot.binding {
+                BindingState::Bound(window) => {
+                    if !present.contains(&window.app)
+                        && server_frames.contains_key(&window.window_id)
+                    {
+                        windows.push((window.clone(), true));
+                    }
+                }
                 BindingState::Unresolved {
                     previous,
                     candidates,
                     ..
-                } => std::iter::once((previous.clone(), true))
-                    .chain(candidates.iter().map(|window| (window.clone(), false)))
-                    .collect(),
-            })
-            .filter(|(window, _)| {
-                !present.contains(&window.app) && server_frames.contains_key(&window.window_id)
-            })
-            .collect();
+                } => {
+                    if !present.contains(&previous.app)
+                        && server_frames.contains_key(&previous.window_id)
+                    {
+                        windows.push((previous.clone(), true));
+                    }
+                    for candidate in candidates {
+                        if !present.contains(&candidate.app)
+                            && server_frames.contains_key(&candidate.window_id)
+                        {
+                            windows.push((candidate.clone(), false));
+                        }
+                    }
+                }
+            }
+        }
         if windows.is_empty() {
             return apps;
         }
-        let observed = live::observed_frames(observation);
         let mut observed_tiles = observed
             .keys()
             .filter(|window| self.workspaces.workspace_of(window) == Some(workspace))

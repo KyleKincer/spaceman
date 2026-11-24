@@ -215,8 +215,12 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         cancelled: &AtomicBool,
         failed: &mut usize,
     ) {
-        let visible_workspaces: HashSet<_> =
-            visible.iter().map(|resolved| resolved.workspace).collect();
+        let hidden_scratchpad = self.scratchpad.hidden();
+        let visible_ids: Vec<_> = visible.iter().map(|resolved| resolved.workspace).collect();
+        if hidden_scratchpad.is_empty() && !self.workspaces.has_inactive_windows(&visible_ids) {
+            return;
+        }
+        let visible_workspaces: HashSet<_> = visible_ids.into_iter().collect();
         let inactive = self.workspaces.inactive_windows_except(&visible_workspaces);
         let displays = outputs.frames().collect::<Vec<_>>();
         let screens = outputs.screens();
@@ -230,7 +234,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         };
         // Hidden scratchpad windows intentionally have no workspace owner, so
         // re-park any background bounds reassertions here before affinity sees them.
-        for window in self.scratchpad.hidden() {
+        for window in hidden_scratchpad {
             if cancelled.load(Ordering::Acquire) {
                 return;
             }

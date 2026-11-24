@@ -370,61 +370,87 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             engine.invalidate();
             engine.begin_cycle()
         };
-        let mut scoped_observation = observation.clone();
-        scoped_observation.cycle = ticket.cycle;
         let settings = self.layout_settings(output);
-        for app in &mut scoped_observation.applications {
-            if let crate::AppObservation::Complete {
-                app: _,
-                focused,
-                windows,
-            } = app
-            {
-                windows.retain(|window| {
-                    let affinity = affinity_policy
-                        .windows
-                        .get(&window.id)
-                        .copied()
-                        .unwrap_or(FrozenWindowAffinity::CurrentDisplay);
-                    match affinity {
-                        FrozenWindowAffinity::Owned(owner)
-                        | FrozenWindowAffinity::PendingReplacement(owner) => owner == workspace,
-                        FrozenWindowAffinity::AmbiguousReplacement
-                        | FrozenWindowAffinity::Floating
-                        | FrozenWindowAffinity::Ignored => false,
-                        FrozenWindowAffinity::Inferred(target)
-                            if affinity_policy.visible_workspaces.contains(&target) =>
-                        {
-                            target == workspace
-                        }
-                        FrozenWindowAffinity::ExplicitRoute(_)
-                        | FrozenWindowAffinity::Inferred(_)
-                        | FrozenWindowAffinity::CurrentDisplay => {
-                            output.contains_center(window.frame)
-                                && self
-                                    .workspaces
-                                    .workspace_of(&window.id)
-                                    .is_none_or(|owner| owner == workspace)
+        let mut observed_frames: crate::model::FastHashMap<crate::PhysicalWindowId, crate::Rect> =
+            crate::model::FastHashMap::with_capacity_and_hasher(
+                self.workspaces
+                    .engine(workspace)
+                    .model()
+                    .workspace
+                    .slots
+                    .len(),
+                Default::default(),
+            );
+        let mut scoped_applications = Vec::with_capacity(observation.applications.len());
+        for app_obs in &observation.applications {
+            match app_obs {
+                crate::AppObservation::Complete {
+                    app,
+                    focused,
+                    windows,
+                } => {
+                    let mut scoped_windows = Vec::new();
+                    let mut focused_kept = false;
+                    for window in windows {
+                        let affinity = affinity_policy
+                            .windows
+                            .get(&window.id)
+                            .copied()
+                            .unwrap_or(FrozenWindowAffinity::CurrentDisplay);
+                        let keep = match affinity {
+                            FrozenWindowAffinity::Owned(owner)
+                            | FrozenWindowAffinity::PendingReplacement(owner) => owner == workspace,
+                            FrozenWindowAffinity::AmbiguousReplacement
+                            | FrozenWindowAffinity::Floating
+                            | FrozenWindowAffinity::Ignored => false,
+                            FrozenWindowAffinity::Inferred(target)
+                                if affinity_policy.visible_workspaces.contains(&target) =>
+                            {
+                                target == workspace
+                            }
+                            FrozenWindowAffinity::ExplicitRoute(_)
+                            | FrozenWindowAffinity::Inferred(_)
+                            | FrozenWindowAffinity::CurrentDisplay => {
+                                output.contains_center(window.frame)
+                                    && self
+                                        .workspaces
+                                        .workspace_of(&window.id)
+                                        .is_none_or(|owner| owner == workspace)
+                            }
+                        };
+                        if keep {
+                            if focused.as_ref() == Some(&window.id) {
+                                focused_kept = true;
+                            }
+                            observed_frames.insert(window.id.clone(), window.frame);
+                            scoped_windows.push(window.clone());
                         }
                     }
-                });
-                if focused
-                    .as_ref()
-                    .is_some_and(|focused| !windows.iter().any(|window| &window.id == focused))
-                {
-                    *focused = None;
+                    scoped_applications.push(crate::AppObservation::Complete {
+                        app: app.clone(),
+                        focused: if focused_kept { focused.clone() } else { None },
+                        windows: scoped_windows,
+                    });
                 }
+                other => scoped_applications.push(other.clone()),
             }
         }
+        let mut scoped_observation = crate::NativeObservation {
+            cycle: ticket.cycle,
+            mouse_down: observation.mouse_down,
+            applications: scoped_applications,
+        };
         self.guard_omitted_windows(
             workspace,
             &mut scoped_observation,
+            &mut observed_frames,
             onscreen_frames,
             close_recheck,
         );
         let apps_with_window_server_evidence = self.apps_with_window_server_evidence(
             workspace,
             &scoped_observation,
+            &observed_frames,
             server_frames,
             onscreen_frames,
             close_recheck,
@@ -435,203 +461,255 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             |app| self.backend.is_process_running(app),
             |app| server_frames.is_none() || apps_with_window_server_evidence.contains(app),
         );
-        let reconciliation = self
+        let decisions = self
             .workspaces
             .engine_mut(workspace)
-            .accept(ticket, &scoped_observation, &settings)
+            .accept_in_place(ticket, &scoped_observation, &settings)
             .map_err(|error| format!("stale workspace cycle: {error:?}"))?;
-        self.log_binding_decisions(workspace, &reconciliation.decisions, affinity_policy);
-        let routes: Vec<_> = reconciliation
-            .decisions
-            .iter()
-            .filter_map(|decision| match decision {
-                Decision::WindowInserted { window, .. } => affinity_policy
-                    .windows
-                    .get(window)
-                    .copied()
-                    .and_then(|affinity| match affinity {
-                        FrozenWindowAffinity::ExplicitRoute(target)
-                        | FrozenWindowAffinity::Inferred(target)
-                            if target != workspace =>
-                        {
-                            Some((window.clone(), target))
-                        }
-                        _ => None,
-                    }),
-                _ => None,
-            })
-            .collect();
+        let mut routes = Vec::new();
         let mut routed_targets = HashSet::new();
-        for (window, target) in &routes {
-            let target_output = output_for(&self.workspaces, *target, outputs);
-            if !affinity_policy.visible_workspaces.contains(target) {
-                match self.park_window_across(window, output, target_output, outputs) {
-                    macos::ApplyOutcome::Applied => {}
-                    macos::ApplyOutcome::Gone => {
-                        self.forget_window(workspace, window);
-                        continue;
-                    }
-                    _ => {
-                        *failed += 1;
-                        continue;
-                    }
+        if !decisions.is_empty() {
+            self.log_binding_decisions(workspace, &decisions, affinity_policy);
+            for decision in &decisions {
+                if let Decision::WindowInserted { window, .. } = decision
+                    && let Some(
+                        FrozenWindowAffinity::ExplicitRoute(target)
+                        | FrozenWindowAffinity::Inferred(target),
+                    ) = affinity_policy.windows.get(window).copied()
+                    && target != workspace
+                {
+                    routes.push((window.clone(), target));
                 }
             }
-            let source_canvas = self.layout_settings(output).canvas();
-            let target_canvas = self.layout_settings(target_output).canvas();
-            if self
-                .workspaces
-                .move_window_with(
-                    window,
-                    *target,
-                    self.config.layout(),
-                    source_canvas,
-                    target_canvas,
+            for (window, target) in &routes {
+                let target_output = output_for(&self.workspaces, *target, outputs);
+                if !affinity_policy.visible_workspaces.contains(target) {
+                    match self.park_window_across(window, output, target_output, outputs) {
+                        macos::ApplyOutcome::Applied => {}
+                        macos::ApplyOutcome::Gone => {
+                            self.forget_window(workspace, window);
+                            continue;
+                        }
+                        _ => {
+                            *failed += 1;
+                            continue;
+                        }
+                    }
+                }
+                let source_canvas = self.layout_settings(output).canvas();
+                let target_canvas = self.layout_settings(target_output).canvas();
+                if self
+                    .workspaces
+                    .move_window_with(
+                        window,
+                        *target,
+                        self.config.layout(),
+                        source_canvas,
+                        target_canvas,
+                    )
+                    .is_none()
+                {
+                    continue;
+                }
+                routed_targets.insert(*target);
+            }
+            for decision in &decisions {
+                let Decision::WindowInserted { window, .. } = decision else {
+                    continue;
+                };
+                let source = match affinity_policy.windows.get(window) {
+                    Some(FrozenWindowAffinity::ExplicitRoute(_)) => PlacementSource::Rule,
+                    Some(FrozenWindowAffinity::Inferred(_)) => PlacementSource::Recall,
+                    Some(FrozenWindowAffinity::CurrentDisplay) | None => PlacementSource::Active,
+                    Some(_) => continue,
+                };
+                if let Some(owner) = self.workspaces.workspace_of(window) {
+                    self.note_placement(window, source, owner);
+                }
+            }
+            let inserted_here = decisions.iter().any(|decision| {
+                matches!(
+                    decision,
+                    Decision::WindowInserted { window, .. }
+                        if !routes.iter().any(|(routed, _)| routed == window)
                 )
-                .is_none()
-            {
-                continue;
+            });
+            if inserted_here {
+                self.exit_fullscreen_if_split(workspace);
             }
-            routed_targets.insert(*target);
-        }
-        for decision in &reconciliation.decisions {
-            let Decision::WindowInserted { window, .. } = decision else {
-                continue;
-            };
-            let source = match affinity_policy.windows.get(window) {
-                Some(FrozenWindowAffinity::ExplicitRoute(_)) => PlacementSource::Rule,
-                Some(FrozenWindowAffinity::Inferred(_)) => PlacementSource::Recall,
-                Some(FrozenWindowAffinity::CurrentDisplay) | None => PlacementSource::Active,
-                Some(_) => continue,
-            };
-            if let Some(owner) = self.workspaces.workspace_of(window) {
-                self.note_placement(window, source, owner);
+            for target in &routed_targets {
+                self.exit_fullscreen_if_split(*target);
             }
-        }
-        let inserted_here = reconciliation.decisions.iter().any(|decision| {
-            matches!(
-                decision,
-                Decision::WindowInserted { window, .. }
-                    if !routes.iter().any(|(routed, _)| routed == window)
-            )
-        });
-        let bound: HashSet<_> = self
-            .workspaces
-            .engine(workspace)
-            .bound_windows()
-            .into_iter()
-            .collect();
-        if inserted_here {
-            self.exit_fullscreen_if_split(workspace);
-        }
-        for target in &routed_targets {
-            self.exit_fullscreen_if_split(*target);
         }
         self.workspaces.prune_intents(workspace);
         self.clear_fullscreen_restore_if_inactive(workspace);
         for target in &routed_targets {
             self.clear_fullscreen_restore_if_inactive(*target);
         }
-        self.constrained[workspace.index()].retain(|window, _| bound.contains(window));
-        self.applied[workspace.index()].retain(|window, _| bound.contains(window));
-        self.apply_attempts[workspace.index()].retain(|window, _| bound.contains(window));
-        let workspaces = &self.workspaces;
-        self.minimum_sizes
-            .retain(|window, _| workspaces.workspace_of(window).is_some());
-        let observed_frames = live::observed_frames(&scoped_observation);
-        let filter_unchanged = routes.is_empty();
-        let engine = self.workspaces.engine_mut(workspace);
-        engine.fit_minimums(&settings, &self.minimum_sizes);
-        let mut placements = engine.placements(&settings);
-        for placement in &placements {
-            engine.record_placement_target(placement.slot, placement.frame);
+        let ws_index = workspace.index();
+        if !self.constrained[ws_index].is_empty()
+            || !self.applied[ws_index].is_empty()
+            || !self.apply_attempts[ws_index].is_empty()
+        {
+            let engine = self.workspaces.engine(workspace);
+            self.constrained[ws_index].retain(|window, _| engine.owns_bound_window(window));
+            self.applied[ws_index].retain(|window, _| engine.owns_bound_window(window));
+            self.apply_attempts[ws_index].retain(|window, _| engine.owns_bound_window(window));
         }
-        self.apply_fullscreen_layout(workspace, &mut placements, &settings);
+        if !self.minimum_sizes.is_empty() {
+            let workspaces = &self.workspaces;
+            self.minimum_sizes
+                .retain(|window, _| workspaces.workspace_of(window).is_some());
+        }
+        let filter_unchanged = routes.is_empty();
+        let fit_changed = self
+            .workspaces
+            .engine_mut(workspace)
+            .fit_minimums(&settings, &self.minimum_sizes);
+        let fullscreen = self.workspaces.uses_fullscreen_layout(workspace);
+        let mut owned_placements = if fullscreen {
+            let mut list = self
+                .workspaces
+                .engine_mut(workspace)
+                .placements_ref(&settings)
+                .to_vec();
+            self.apply_fullscreen_layout(workspace, &mut list, &settings);
+            Some(list)
+        } else {
+            if fit_changed || !routes.is_empty() {
+                let engine = self.workspaces.engine_mut(workspace);
+                let list = engine.placements_ref(&settings).to_vec();
+                for placement in &list {
+                    engine.record_placement_target(placement.slot, placement.frame);
+                }
+            }
+            None
+        };
+        let placements_slice: &[crate::Placement] = match &owned_placements {
+            Some(list) => list.as_slice(),
+            None => self
+                .workspaces
+                .engine_mut(workspace)
+                .placements_ref(&settings),
+        };
+        let mut to_apply = Vec::new();
         if !scoped_observation.mouse_down {
-            for placement in &placements {
+            for placement in placements_slice {
                 let Some(window) = placement.window.as_ref() else {
                     continue;
                 };
-                let Some(&observed) = observed_frames.get(window) else {
-                    continue;
-                };
                 let target = placement.frame;
-                if observed.approximately_equals(target, settings.frame_tolerance) {
-                    let settling = self.applied[workspace.index()]
-                        .get(window)
-                        .is_some_and(|applied| applied.is_settling(target));
-                    if !settling {
-                        self.applied[workspace.index()].remove(window);
-                        self.constrained[workspace.index()].remove(window);
-                        self.apply_attempts[workspace.index()].remove(window);
+                let observed = observed_frames.get(window).copied();
+                if let Some(observed) = observed {
+                    if observed.approximately_equals(target, settings.frame_tolerance) {
+                        if !self.applied[ws_index].is_empty()
+                            || !self.constrained[ws_index].is_empty()
+                            || !self.apply_attempts[ws_index].is_empty()
+                        {
+                            let settling = self.applied[ws_index]
+                                .get(window)
+                                .is_some_and(|applied| applied.is_settling(target));
+                            if !settling {
+                                self.applied[ws_index].remove(window);
+                                self.constrained[ws_index].remove(window);
+                                self.apply_attempts[ws_index].remove(window);
+                            }
+                        }
+                        if filter_unchanged {
+                            continue;
+                        }
+                    } else {
+                        if self.constrained[ws_index]
+                            .get(window)
+                            .is_some_and(|(constrained_target, _)| *constrained_target != target)
+                        {
+                            self.constrained[ws_index].remove(window);
+                        }
+                        if self.apply_attempts[ws_index]
+                            .get(window)
+                            .is_some_and(|(attempted_target, _)| *attempted_target != target)
+                        {
+                            self.apply_attempts[ws_index].remove(window);
+                        }
+                        if self.applied[ws_index]
+                            .remove(window)
+                            .is_some_and(|applied| applied.target == target)
+                        {
+                            self.constrained[ws_index].insert(window.clone(), (target, observed));
+                            record_apply_attempt(
+                                &mut self.apply_attempts[ws_index],
+                                workspace,
+                                window,
+                                target,
+                            );
+                        }
+                        if self.apply_attempts[ws_index].get(window).is_some_and(
+                            |(attempted_target, count)| {
+                                *attempted_target == target && *count >= APPLY_ATTEMPT_LIMIT
+                            },
+                        ) {
+                            self.constrained[ws_index]
+                                .entry(window.clone())
+                                .or_insert((target, observed));
+                        }
                     }
+                } else if filter_unchanged {
                     continue;
                 }
-                if self.constrained[workspace.index()]
+                if self.apply_attempts[ws_index]
                     .get(window)
-                    .is_some_and(|(constrained_target, _)| *constrained_target != target)
+                    .is_some_and(|(t, count)| *t == target && *count >= APPLY_ATTEMPT_LIMIT)
                 {
-                    self.constrained[workspace.index()].remove(window);
+                    continue;
                 }
-                if self.apply_attempts[workspace.index()]
+                if self.constrained[ws_index]
                     .get(window)
-                    .is_some_and(|(attempted_target, _)| *attempted_target != target)
-                {
-                    self.apply_attempts[workspace.index()].remove(window);
-                }
-                if self.applied[workspace.index()]
-                    .remove(window)
-                    .is_some_and(|applied| applied.target == target)
-                {
-                    self.constrained[workspace.index()].insert(window.clone(), (target, observed));
-                    record_apply_attempt(
-                        &mut self.apply_attempts[workspace.index()],
-                        workspace,
-                        window,
-                        target,
-                    );
-                }
-                if self.apply_attempts[workspace.index()]
-                    .get(window)
-                    .is_some_and(|(attempted_target, count)| {
-                        *attempted_target == target && *count >= APPLY_ATTEMPT_LIMIT
+                    .zip(observed)
+                    .is_some_and(|((t, accepted), obs)| {
+                        *t == target
+                            && obs.approximately_equals(*accepted, settings.frame_tolerance)
                     })
                 {
-                    self.constrained[workspace.index()]
-                        .entry(window.clone())
-                        .or_insert((target, observed));
+                    continue;
                 }
+                to_apply.push(placement.clone());
+            }
+        } else {
+            for placement in placements_slice {
+                let Some(window) = placement.window.as_ref() else {
+                    continue;
+                };
+                if filter_unchanged
+                    && !observed_frames.get(window).is_some_and(|frame| {
+                        !frame.approximately_equals(placement.frame, settings.frame_tolerance)
+                    })
+                {
+                    continue;
+                }
+                if self.apply_attempts[ws_index]
+                    .get(window)
+                    .is_some_and(|(t, count)| {
+                        *t == placement.frame && *count >= APPLY_ATTEMPT_LIMIT
+                    })
+                {
+                    continue;
+                }
+                if self.constrained[ws_index]
+                    .get(window)
+                    .zip(observed_frames.get(window))
+                    .is_some_and(|((t, accepted), obs)| {
+                        *t == placement.frame
+                            && obs.approximately_equals(*accepted, settings.frame_tolerance)
+                    })
+                {
+                    continue;
+                }
+                to_apply.push(placement.clone());
             }
         }
-        if filter_unchanged {
-            placements.retain(|placement| {
-                live::needs_application(placement, &observed_frames, settings.frame_tolerance)
-            });
-        }
-        placements.retain(|placement| {
-            let Some(window) = placement.window.as_ref() else {
-                return false;
-            };
-            if self.apply_attempts[workspace.index()]
-                .get(window)
-                .is_some_and(|(target, count)| {
-                    *target == placement.frame && *count >= APPLY_ATTEMPT_LIMIT
-                })
-            {
-                return false;
-            }
-            !self.constrained[workspace.index()]
-                .get(window)
-                .zip(observed_frames.get(window))
-                .is_some_and(|((target, accepted), observed)| {
-                    *target == placement.frame
-                        && observed.approximately_equals(*accepted, settings.frame_tolerance)
-                })
-        });
-        if !placements.is_empty() {
-            let results = self
-                .backend
-                .apply_observed(&placements, &settings, cancelled);
+        let _ = owned_placements.take();
+        if !to_apply.is_empty() {
+            let results = self.backend.apply_observed(&to_apply, &settings, cancelled);
             self.record_results(workspace, &results);
             let initially_failed = failed_results(&results);
             *failed += self

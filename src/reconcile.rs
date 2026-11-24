@@ -128,14 +128,25 @@ pub fn reconcile(
     evidence: &ReconciliationEvidence,
     settings: &Settings,
 ) -> Reconciliation {
+    let (model, decisions) = reconcile_model(model, observation, evidence, settings);
+    let placements = flat_placements(settings, model.workspace.axis, &model.workspace.slots);
+    Reconciliation {
+        model,
+        placements,
+        decisions,
+    }
+}
+
+pub(crate) fn reconcile_model(
+    model: &Model,
+    observation: &NativeObservation,
+    evidence: &ReconciliationEvidence,
+    settings: &Settings,
+) -> (Model, Vec<Decision>) {
     if observation.mouse_down {
         let mut model = model.clone();
         reset_settling(&mut model, observation.cycle, None);
-        return Reconciliation {
-            placements: flat_placements(settings, model.workspace.axis, &model.workspace.slots),
-            model,
-            decisions: vec![Decision::MouseDownDeferred],
-        };
+        return (model, vec![Decision::MouseDownDeferred]);
     }
 
     let mut next = model.clone();
@@ -168,17 +179,23 @@ pub fn reconcile(
                     settings,
                 };
                 if !reconcile_unresolved(&mut next, &app.id, &context, &mut decisions) {
-                    let current: HashSet<_> =
-                        windows.iter().map(|window| window.id.clone()).collect();
-                    let existing: HashSet<_> = next
+                    let current: crate::model::FastHashSet<_> =
+                        windows.iter().map(|window| &window.id).collect();
+                    let existing: crate::model::FastHashSet<_> = next
                         .workspace
                         .slots
                         .iter()
                         .filter(|slot| slot.belongs_to(&app.id))
-                        .filter_map(|slot| slot.bound_window().cloned())
+                        .filter_map(|slot| slot.bound_window())
                         .collect();
-                    let stale: Vec<_> = existing.difference(&current).cloned().collect();
-                    let new: Vec<_> = current.difference(&existing).cloned().collect();
+                    let stale: Vec<_> = existing
+                        .difference(&current)
+                        .map(|window| (*window).clone())
+                        .collect();
+                    let new: Vec<_> = current
+                        .difference(&existing)
+                        .map(|window| (*window).clone())
+                        .collect();
 
                     let replacement = app.bundle_id == "com.mitchellh.ghostty"
                         && replacement_candidate(&next, &stale, &new, &context);
@@ -235,12 +252,7 @@ pub fn reconcile(
         }
     }
 
-    let placements = flat_placements(settings, next.workspace.axis, &next.workspace.slots);
-    Reconciliation {
-        model: next,
-        placements,
-        decisions,
-    }
+    (next, decisions)
 }
 
 struct AppReconcileContext<'a> {

@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use crate::{
     journal::{CORRECTION_WINDOW, PlacementSource},
     window_memory::{RememberedWindow, WindowMemory},
@@ -355,28 +353,41 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// Fold settled ownership back into the memory once it has held for
     /// [`MEMORY_SETTLE`], then persist any change.
     pub(super) fn record_window_memory(&mut self, server_frames: &HashMap<u32, crate::Rect>) {
-        let recalling: HashSet<_> = self
-            .memory
-            .recalls
-            .values()
-            .map(|recall| recall.bundle_id.clone())
-            .collect();
-        let mut current: BTreeMap<String, Vec<(u32, RememberedWindow)>> = BTreeMap::new();
+        if self.memory.bundles.is_empty() && self.memory.pending.is_empty() {
+            return;
+        }
+        let recalling: crate::model::FastHashSet<&str> = if self.memory.recalls.is_empty() {
+            crate::model::FastHashSet::default()
+        } else {
+            self.memory
+                .recalls
+                .values()
+                .map(|recall| recall.bundle_id.as_str())
+                .collect()
+        };
+        let mut current: crate::model::FastHashMap<&str, Vec<(u32, RememberedWindow)>> =
+            crate::model::FastHashMap::default();
+        let bundles = &self.memory.bundles;
+        let parked = &self.parked;
         let mut add = |window: &crate::PhysicalWindowId, workspace, floating| {
-            let Some(bundle_id) = self.memory.bundles.get(&window.app).filter(|bundle_id| {
-                is_rememberable_bundle_id(bundle_id) && !recalling.contains(*bundle_id)
-            }) else {
+            let Some(bundle_id) =
+                bundles
+                    .get(&window.app)
+                    .map(String::as_str)
+                    .filter(|bundle_id| {
+                        is_rememberable_bundle_id(bundle_id) && !recalling.contains(bundle_id)
+                    })
+            else {
                 return;
             };
-            let Some(frame) = self
-                .parked
+            let Some(frame) = parked
                 .get(window)
                 .or_else(|| server_frames.get(&window.window_id))
                 .copied()
             else {
                 return;
             };
-            current.entry(bundle_id.clone()).or_default().push((
+            current.entry(bundle_id).or_default().push((
                 window.window_id,
                 RememberedWindow {
                     workspace,
@@ -386,56 +397,87 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             ));
         };
         for workspace in WorkspaceId::all() {
-            for window in self.workspaces.engine(workspace).bound_windows() {
-                add(&window, workspace, false);
-            }
-        }
-        for (window, workspace) in self.workspaces.floating_entries() {
-            add(window, workspace, true);
-        }
-        let now = Instant::now();
-        self.memory
-            .pending
-            .retain(|bundle_id, _| current.contains_key(bundle_id));
-        let mut recorded = Vec::new();
-        for (bundle_id, mut windows) in current {
-            windows.sort_by_key(|(window_id, _)| *window_id);
-            let windows: Vec<_> = windows
-                .into_iter()
-                .map(|(_, placement)| placement)
-                .take(crate::window_memory::MAX_WINDOWS_PER_APP)
-                .collect();
-            if self
-                .memory
-                .memory
-                .get(&bundle_id)
-                .is_some_and(|remembered| remembered.windows == windows)
-            {
-                self.memory.pending.remove(&bundle_id);
+            let engine = self.workspaces.engine(workspace);
+            if engine.is_empty() {
                 continue;
             }
-            match self.memory.pending.get(&bundle_id) {
-                Some((pending, since)) if *pending == windows => {
+            for slot in &engine.model().workspace.slots {
+                if let Some(window) = slot.bound_window() {
+                    add(window, workspace, false);
+                }
+            }
+        }
+        if self.workspaces.has_floating() {
+            for (window, workspace) in self.workspaces.floating_entries() {
+                add(window, workspace, true);
+            }
+        }
+        if !self.memory.pending.is_empty() {
+            self.memory
+                .pending
+                .retain(|bundle_id, _| current.contains_key(bundle_id.as_str()));
+        }
+        if current.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let mut recorded = Vec::new();
+        let mut pending_updates: Vec<(String, Vec<RememberedWindow>)> = Vec::new();
+        let mut pending_removals: Vec<String> = Vec::new();
+        for (bundle_id, mut windows) in current {
+            windows.sort_by_key(|(window_id, _)| *window_id);
+            let limit = windows.len().min(crate::window_memory::MAX_WINDOWS_PER_APP);
+            let slice = &windows[..limit];
+            if self.memory.memory.get(bundle_id).is_some_and(|remembered| {
+                remembered.windows.len() == limit
+                    && remembered
+                        .windows
+                        .iter()
+                        .zip(slice.iter())
+                        .all(|(saved, (_, cur))| saved == cur)
+            }) {
+                if self.memory.pending.contains_key(bundle_id) {
+                    pending_removals.push(bundle_id.to_owned());
+                }
+                continue;
+            }
+            match self.memory.pending.get(bundle_id) {
+                Some((pending, since))
+                    if pending.len() == limit
+                        && pending
+                            .iter()
+                            .zip(slice.iter())
+                            .all(|(p, (_, cur))| p == cur) =>
+                {
                     if now.duration_since(*since) >= MEMORY_SETTLE {
-                        self.memory.pending.remove(&bundle_id);
-                        let count = windows.len();
+                        pending_removals.push(bundle_id.to_owned());
+                        let owned: Vec<_> = slice.iter().map(|(_, p)| *p).collect();
+                        let count = owned.len();
                         if self.memory.memory.record(
-                            &bundle_id,
-                            windows,
+                            bundle_id,
+                            owned,
                             crate::journal::unix_millis() / 1_000,
                         ) {
-                            recorded.push((bundle_id, count));
+                            recorded.push((bundle_id.to_owned(), count));
                         }
                     }
                 }
                 _ => {
-                    self.memory.pending.insert(bundle_id, (windows, now));
+                    let owned: Vec<_> = slice.iter().map(|(_, p)| *p).collect();
+                    pending_updates.push((bundle_id.to_owned(), owned));
                 }
             }
+        }
+        for bundle_id in pending_removals {
+            self.memory.pending.remove(&bundle_id);
+        }
+        for (bundle_id, windows) in pending_updates {
+            self.memory.pending.insert(bundle_id, (windows, now));
         }
         if recorded.is_empty() {
             return;
         }
+        recorded.sort_by(|a, b| a.0.cmp(&b.0));
         for (bundle_id, windows) in recorded {
             self.journal_event(crate::journal::JournalEvent::Remembered { bundle_id, windows });
         }

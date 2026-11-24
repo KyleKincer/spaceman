@@ -1,6 +1,10 @@
 use crate::{
-    Model, NativeObservation, PhysicalWindowId, Placement, Reconciliation, ReconciliationEvidence,
-    Settings, Slot, config::LayoutMode, layout_tree::LayoutTree, reconcile,
+    AppInstanceId, AppObservation, BindingState, Decision, Model, NativeObservation,
+    PhysicalWindowId, Placement, Reconciliation, ReconciliationEvidence, Settings, Slot, SlotId,
+    config::LayoutMode,
+    layout_tree::LayoutTree,
+    model::{FastHashMap, FastHashSet},
+    reconcile::reconcile_model,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,8 +29,15 @@ pub struct Engine {
     insertion_focus: Option<crate::SlotId>,
     evidence: ReconciliationEvidence,
     revision: u64,
+    persisted_revision: u64,
     next_cycle: u64,
     pending: Option<CycleTicket>,
+    // O(1) lookup indices kept in sync with `model.workspace.slots`.
+    slot_positions: FastHashMap<SlotId, usize>,
+    identity_windows: FastHashMap<PhysicalWindowId, usize>,
+    app_slot_counts: FastHashMap<AppInstanceId, usize>,
+    unresolved_count: usize,
+    cached_placements: Option<(Settings, Vec<Placement>)>,
 }
 
 #[derive(Clone, Debug)]
@@ -58,6 +69,24 @@ impl Engine {
         observation: &NativeObservation,
         settings: &Settings,
     ) -> Result<Reconciliation, StaleCycle> {
+        let decisions = self.accept_in_place(ticket, observation, settings)?;
+        let placements = self.placements_ref(settings).to_vec();
+        Ok(Reconciliation {
+            model: self.model.clone(),
+            placements,
+            decisions,
+        })
+    }
+
+    /// Reconcile `observation` into `self` in place. On steady-state cycles
+    /// where every Complete app's window set matches its bound slots, this
+    /// avoids cloning `Model`, rebuilding layout trees, or allocating placements.
+    pub(crate) fn accept_in_place(
+        &mut self,
+        ticket: CycleTicket,
+        observation: &NativeObservation,
+        settings: &Settings,
+    ) -> Result<Vec<Decision>, StaleCycle> {
         if self.pending != Some(ticket) || observation.cycle != ticket.cycle {
             return Err(StaleCycle {
                 ticket,
@@ -66,28 +95,202 @@ impl Engine {
         }
         self.pending = None;
 
-        let mut result = reconcile(&self.model, observation, &self.evidence, settings);
-        if self.layout.sync_near(
-            result.model.workspace.axis,
-            &result.model.workspace.slots,
-            self.insertion_focus,
-            settings.layout,
-            settings.canvas(),
-        ) {
-            result.model.workspace.axis = self.layout.root_axis();
-            self.fit = None;
-            self.insertion_focus = self
-                .insertion_focus
-                .filter(|&id| result.model.slot(id).is_some());
+        if self.try_steady_state_reconcile(observation) {
+            if self
+                .cached_placements
+                .as_ref()
+                .is_none_or(|(cached_settings, _)| cached_settings != settings)
+            {
+                self.refresh_cached_placements(settings);
+            }
+            return Ok(Vec::new());
         }
-        result.placements = placements_for(self.display_layout(), &result.model, settings);
-        self.evidence.previous_placements = result
-            .placements
-            .iter()
-            .map(|placement| (placement.slot, placement.frame))
-            .collect();
-        self.model = result.model.clone();
-        Ok(result)
+
+        let (next_model, decisions) =
+            reconcile_model(&self.model, observation, &self.evidence, settings);
+        let slots_changed = self.model.workspace.slots != next_model.workspace.slots
+            || self.model.workspace.axis != next_model.workspace.axis;
+        self.model = next_model;
+        if slots_changed {
+            self.rebuild_slot_indices();
+            if self.layout.sync_near(
+                self.model.workspace.axis,
+                &self.model.workspace.slots,
+                self.insertion_focus,
+                settings.layout,
+                settings.canvas(),
+            ) {
+                self.model.workspace.axis = self.layout.root_axis();
+                self.fit = None;
+                self.insertion_focus = self
+                    .insertion_focus
+                    .filter(|&id| self.slot_positions.contains_key(&id));
+            }
+            self.persisted_revision = self.persisted_revision.saturating_add(1);
+            self.cached_placements = None;
+        }
+        self.refresh_cached_placements(settings);
+        Ok(decisions)
+    }
+
+    fn try_steady_state_reconcile(&mut self, observation: &NativeObservation) -> bool {
+        if observation.mouse_down || self.unresolved_count > 0 {
+            return false;
+        }
+        let slots = &self.model.workspace.slots;
+        let mut seen = vec![false; slots.len()];
+        let mut seen_apps: FastHashSet<&AppInstanceId> = FastHashSet::with_capacity_and_hasher(
+            observation.applications.len(),
+            Default::default(),
+        );
+        for app_observation in &observation.applications {
+            let AppObservation::Complete { app, windows, .. } = app_observation else {
+                return false;
+            };
+            if !seen_apps.insert(&app.id) {
+                return false;
+            }
+            let expected = self.app_slot_counts.get(&app.id).copied().unwrap_or(0);
+            if windows.len() != expected {
+                return false;
+            }
+            for window in windows {
+                if window.id.app != app.id {
+                    return false;
+                }
+                let Some(&index) = self.identity_windows.get(&window.id) else {
+                    return false;
+                };
+                if seen[index] || slots[index].bound_window() != Some(&window.id) {
+                    return false;
+                }
+                seen[index] = true;
+            }
+        }
+        // Maintain identical `model.continuity` updates in place.
+        for app_observation in &observation.applications {
+            if let AppObservation::Complete { app, focused, .. } = app_observation {
+                if let Some(entry) = self.model.continuity.get_mut(&app.id) {
+                    if entry.previous_focused != *focused {
+                        entry.previous_focused.clone_from(focused);
+                    }
+                } else {
+                    self.model.continuity.insert(
+                        app.id.clone(),
+                        crate::model::AppContinuity {
+                            previous_focused: focused.clone(),
+                        },
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    fn refresh_cached_placements(&mut self, settings: &Settings) {
+        let placements = self.compute_placements(settings);
+        self.evidence.previous_placements.clear();
+        self.evidence.previous_placements.reserve(placements.len());
+        for placement in &placements {
+            self.evidence
+                .previous_placements
+                .insert(placement.slot, placement.frame);
+        }
+        self.cached_placements = Some((settings.clone(), placements));
+    }
+
+    fn compute_placements(&self, settings: &Settings) -> Vec<Placement> {
+        self.compute_placements_for(self.display_layout(), settings)
+    }
+
+    fn compute_placements_for(&self, layout: &LayoutTree, settings: &Settings) -> Vec<Placement> {
+        settings
+            .spacing
+            .place(settings.usable(), layout.placements(settings.canvas()))
+            .into_iter()
+            .filter_map(|(id, frame)| {
+                let slot = self.slot_by_id(id)?;
+                Some(Placement {
+                    slot: id,
+                    window: slot.bound_window().cloned(),
+                    frame,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn placements_ref(&mut self, settings: &Settings) -> &[Placement] {
+        let hit = self
+            .cached_placements
+            .as_ref()
+            .is_some_and(|(cached_settings, _)| cached_settings == settings);
+        if !hit {
+            let placements = self.compute_placements(settings);
+            return &self
+                .cached_placements
+                .insert((settings.clone(), placements))
+                .1;
+        }
+        match self.cached_placements.as_ref() {
+            Some((_, cached)) => cached,
+            None => &[],
+        }
+    }
+
+    #[inline]
+    pub(crate) fn slot_by_id(&self, id: SlotId) -> Option<&Slot> {
+        let &index = self.slot_positions.get(&id)?;
+        self.model.workspace.slots.get(index)
+    }
+
+    #[inline]
+    pub(crate) fn owns_window(&self, window: &PhysicalWindowId) -> bool {
+        self.identity_windows.contains_key(window)
+    }
+
+    #[inline]
+    pub(crate) fn owns_bound_window(&self, window: &PhysicalWindowId) -> bool {
+        self.identity_windows
+            .get(window)
+            .and_then(|&index| self.model.workspace.slots.get(index))
+            .is_some_and(|slot| slot.bound_window() == Some(window))
+    }
+
+    #[inline]
+    pub(crate) fn owns_app(&self, app: &AppInstanceId) -> bool {
+        self.app_slot_counts.contains_key(app)
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.model.workspace.slots.is_empty()
+    }
+
+    #[inline]
+    pub(crate) const fn persisted_revision(&self) -> u64 {
+        self.persisted_revision
+    }
+
+    fn rebuild_slot_indices(&mut self) {
+        self.slot_positions.clear();
+        self.identity_windows.clear();
+        self.app_slot_counts.clear();
+        self.unresolved_count = 0;
+        let len = self.model.workspace.slots.len();
+        self.slot_positions.reserve(len);
+        self.identity_windows.reserve(len);
+        for (index, slot) in self.model.workspace.slots.iter().enumerate() {
+            self.slot_positions.insert(slot.id, index);
+            let identity = slot.identity_window();
+            self.identity_windows.insert(identity.clone(), index);
+            *self
+                .app_slot_counts
+                .entry(identity.app.clone())
+                .or_insert(0) += 1;
+            if matches!(slot.binding, BindingState::Unresolved { .. }) {
+                self.unresolved_count += 1;
+            }
+        }
     }
 
     #[must_use]
@@ -102,16 +305,23 @@ impl Engine {
 
     #[must_use]
     pub fn bound_windows(&self) -> Vec<PhysicalWindowId> {
-        self.layout
-            .slots()
-            .into_iter()
-            .filter_map(|id| self.model.slot(id)?.bound_window().cloned())
-            .collect()
+        let mut windows = Vec::with_capacity(self.model.workspace.slots.len());
+        self.layout.for_each_slot(&mut |id| {
+            if let Some(window) = self.slot_by_id(id).and_then(Slot::bound_window) {
+                windows.push(window.clone());
+            }
+        });
+        windows
     }
 
     #[must_use]
     pub fn placements(&self, settings: &Settings) -> Vec<Placement> {
-        placements_for(self.display_layout(), &self.model, settings)
+        if let Some((cached_settings, cached)) = &self.cached_placements
+            && cached_settings == settings
+        {
+            return cached.clone();
+        }
+        self.compute_placements(settings)
     }
 
     pub(crate) fn record_placement_target(&mut self, slot: crate::SlotId, frame: crate::Rect) {
@@ -134,13 +344,12 @@ impl Engine {
         mode: LayoutMode,
         output: crate::Rect,
     ) -> Option<Slot> {
-        let index = self
-            .model
-            .workspace
-            .slots
-            .iter()
-            .position(|slot| slot.bound_window() == Some(window))?;
+        let index = *self.identity_windows.get(window)?;
+        if self.model.workspace.slots[index].bound_window() != Some(window) {
+            return None;
+        }
         let slot = self.model.workspace.slots.remove(index);
+        self.rebuild_slot_indices();
         self.layout.sync_near(
             self.model.workspace.axis,
             &self.model.workspace.slots,
@@ -161,6 +370,10 @@ impl Engine {
         mode: LayoutMode,
         output: crate::Rect,
     ) -> bool {
+        if !self.app_slot_counts.contains_key(app) {
+            self.model.continuity.remove(app);
+            return false;
+        }
         let before = self.model.workspace.slots.len();
         self.model
             .workspace
@@ -170,10 +383,11 @@ impl Engine {
         if self.model.workspace.slots.len() == before {
             return false;
         }
-        let slots = &self.model.workspace.slots;
+        self.rebuild_slot_indices();
+        let positions = &self.slot_positions;
         self.evidence
             .previous_placements
-            .retain(|id, _| slots.iter().any(|slot| slot.id == *id));
+            .retain(|id, _| positions.contains_key(id));
         self.layout.sync_near(
             self.model.workspace.axis,
             &self.model.workspace.slots,
@@ -197,17 +411,12 @@ impl Engine {
         output: crate::Rect,
         anchor: Option<crate::SlotId>,
     ) {
-        if self
-            .model
-            .workspace
-            .slots
-            .iter()
-            .any(|existing| existing.id == slot.id)
-        {
+        if self.slot_positions.contains_key(&slot.id) {
             slot.id = crate::SlotId(self.model.next_slot_id);
         }
         self.model.next_slot_id = self.model.next_slot_id.max(slot.id.0.saturating_add(1));
         self.model.workspace.slots.push(slot);
+        self.rebuild_slot_indices();
         self.layout.sync_near(
             self.model.workspace.axis,
             &self.model.workspace.slots,
@@ -288,7 +497,7 @@ impl Engine {
         let fitted = (!slots.is_empty())
             .then(|| layout.fitted(settings.canvas(), &slots))
             .flatten();
-        placements_for(fitted.as_ref().unwrap_or(layout), &self.model, settings)
+        self.compute_placements_for(fitted.as_ref().unwrap_or(layout), settings)
     }
 
     /// Commit an already-edited layout tree as the workspace's requested layout.
@@ -305,7 +514,11 @@ impl Engine {
         let output = settings.canvas();
         let slots = self.slot_minimums(settings, minimums);
         if slots.is_empty() {
-            return self.fit.take().is_some_and(|fit| fit.tree.is_some());
+            let changed = self.fit.take().is_some_and(|fit| fit.tree.is_some());
+            if changed {
+                self.cached_placements = None;
+            }
+            return changed;
         }
         if self
             .fit
@@ -321,6 +534,9 @@ impl Engine {
             minimums: slots,
             tree,
         });
+        if changed {
+            self.cached_placements = None;
+        }
         changed
     }
 
@@ -406,19 +622,11 @@ impl Engine {
 
     /// Each tile's slot, window and frame in `output`, in layout order.
     pub(crate) fn preview_placements(&self, output: crate::Rect) -> Vec<Placement> {
-        placements_for(
-            self.display_layout(),
-            &self.model,
-            &Settings::for_output(output),
-        )
+        self.compute_placements(&Settings::for_output(output))
     }
 
     pub(crate) fn preview(&self, output: crate::Rect) -> Vec<crate::Rect> {
-        self.display_layout()
-            .placements(output)
-            .into_iter()
-            .map(|(_, frame)| frame)
-            .collect()
+        self.display_layout().preview_rects(output)
     }
 
     pub(crate) fn restore_layout(&mut self, mut layout: LayoutTree) {
@@ -428,12 +636,9 @@ impl Engine {
     }
 
     pub(crate) fn slot_for_window(&self, window: &PhysicalWindowId) -> Option<crate::SlotId> {
-        self.model
-            .workspace
-            .slots
-            .iter()
-            .find(|slot| slot.bound_window() == Some(window))
-            .map(|slot| slot.id)
+        let &index = self.identity_windows.get(window)?;
+        let slot = self.model.workspace.slots.get(index)?;
+        (slot.bound_window() == Some(window)).then_some(slot.id)
     }
 
     /// Edits the layout on display, a fit included, and saves it. Only for
@@ -492,30 +697,31 @@ impl Engine {
         else {
             return self.edit_shown(window, op);
         };
-        let Some(slot) = self
-            .model
-            .workspace
-            .slots
-            .iter()
-            .find(|slot| slot.bound_window() == Some(window))
-            .map(|slot| slot.id)
-        else {
+        let Some(&index) = self.identity_windows.get(window) else {
             return false;
         };
+        let slot_entry = &self.model.workspace.slots[index];
+        if slot_entry.bound_window() != Some(window) {
+            return false;
+        }
+        let slot = slot_entry.id;
         let mut edited = tree.clone();
         if !op(&mut edited, slot) {
             return false;
         }
         *tree = edited;
+        self.cached_placements = None;
         self.invalidate();
         true
     }
 
     fn invalidate_layout(&mut self) {
         self.fit = None;
+        self.cached_placements = None;
+        self.persisted_revision = self.persisted_revision.saturating_add(1);
         self.insertion_focus = self
             .insertion_focus
-            .filter(|&id| self.model.slot(id).is_some());
+            .filter(|&id| self.slot_positions.contains_key(&id));
         self.invalidate();
     }
 
@@ -528,22 +734,6 @@ impl Engine {
         }
         self.invalidate_layout();
     }
-}
-
-fn placements_for(layout: &LayoutTree, model: &Model, settings: &Settings) -> Vec<Placement> {
-    settings
-        .spacing
-        .place(settings.usable(), layout.placements(settings.canvas()))
-        .into_iter()
-        .filter_map(|(id, frame)| {
-            let slot = model.slot(id)?;
-            Some(Placement {
-                slot: id,
-                window: slot.bound_window().cloned(),
-                frame,
-            })
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -876,5 +1066,81 @@ mod tests {
                 .is_err()
         );
         assert_eq!(engine.model().workspace.slots.len(), 1);
+    }
+
+    #[test]
+    fn steady_state_accept_in_place_updates_continuity_and_preserves_revision() {
+        let mut engine = Engine::default();
+        let app = AppInstanceId {
+            pid: 7,
+            launched_at: 42,
+        };
+        let w1 = PhysicalWindowId {
+            app: app.clone(),
+            window_id: 1,
+        };
+        let w2 = PhysicalWindowId {
+            app: app.clone(),
+            window_id: 2,
+        };
+        let make_obs = |cycle: u64, focused: Option<PhysicalWindowId>| NativeObservation {
+            cycle,
+            mouse_down: false,
+            applications: vec![AppObservation::Complete {
+                app: crate::ObservedApplication {
+                    id: app.clone(),
+                    bundle_id: "com.example.App".into(),
+                },
+                focused,
+                windows: vec![
+                    crate::ObservedWindow {
+                        id: w1.clone(),
+                        frame: crate::Rect {
+                            x: 0,
+                            y: 0,
+                            width: 500,
+                            height: 800,
+                        },
+                        resizable: true,
+                        title: None,
+                    },
+                    crate::ObservedWindow {
+                        id: w2.clone(),
+                        frame: crate::Rect {
+                            x: 500,
+                            y: 0,
+                            width: 500,
+                            height: 800,
+                        },
+                        resizable: true,
+                        title: None,
+                    },
+                ],
+            }],
+        };
+
+        let s = settings();
+        let t1 = engine.begin_cycle();
+        let first = engine
+            .accept(t1, &make_obs(t1.cycle, Some(w1.clone())), &s)
+            .unwrap();
+        let rev_after_first = engine.persisted_revision();
+
+        // Steady-state cycle with changed focus must update continuity without bumping persisted revision.
+        let t2 = engine.begin_cycle();
+        let decisions = engine
+            .accept_in_place(t2, &make_obs(t2.cycle, Some(w2.clone())), &s)
+            .unwrap();
+        assert!(decisions.is_empty());
+        assert_eq!(engine.persisted_revision(), rev_after_first);
+        assert_eq!(
+            engine
+                .model()
+                .continuity
+                .get(&app)
+                .and_then(|c| c.previous_focused.as_ref()),
+            Some(&w2)
+        );
+        assert_eq!(engine.placements_ref(&s), first.placements.as_slice());
     }
 }

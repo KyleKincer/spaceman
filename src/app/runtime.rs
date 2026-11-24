@@ -92,6 +92,7 @@ pub(super) struct WorkspaceRuntime<B = MacWorkspaceBackend> {
     pub(super) pending_fullscreen_focus_restore: HashSet<WorkspaceId>,
     pub(super) exact_spacing_workspaces: HashSet<WorkspaceId>,
     pub(super) persisted_workspace_state: crate::workspace::WorkspaceState,
+    persisted_workspace_signature: Option<(u64, [u64; WorkspaceId::COUNT])>,
     /// Title-free placements that survive application relaunches and reboots.
     pub(super) memory: MemoryState,
     pub(super) journal: JournalState,
@@ -365,6 +366,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .collect()
         });
         let persisted_workspace_state = workspaces.state();
+        let persisted_workspace_signature = Some(workspaces.state_revision_signature());
         let manual_floating = super::commands::restored_floating(&workspaces);
         let has_spacing = !config.spacing().is_none();
         Self {
@@ -398,6 +400,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             pending_fullscreen_focus_restore,
             exact_spacing_workspaces: WorkspaceId::all().filter(|_| has_spacing).collect(),
             persisted_workspace_state,
+            persisted_workspace_signature,
             memory: MemoryState::default(),
             journal: JournalState::default(),
             displays: super::displays::DisplayWatch::default(),
@@ -699,12 +702,18 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     }
 
     pub(super) fn persist_workspace_state_if_changed(&mut self) -> Result<(), String> {
+        let signature = self.workspaces.state_revision_signature();
+        if self.persisted_workspace_signature == Some(signature) {
+            return Ok(());
+        }
         let state = self.workspaces.state();
         if state == self.persisted_workspace_state {
+            self.persisted_workspace_signature = Some(signature);
             return Ok(());
         }
         self.backend.persist_workspace_state(&state)?;
         self.persisted_workspace_state = state;
+        self.persisted_workspace_signature = Some(signature);
         Ok(())
     }
 
@@ -759,8 +768,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 self.workspaces.is_enabled(*workspace)
                     && self.scope.manages_selector(selector)
                     && outputs.resolve(selector).id == display_id
-                    && (current == Some(*workspace)
-                        || !self.workspaces.windows(*workspace).is_empty())
+                    && (current == Some(*workspace) || self.workspaces.has_windows(*workspace))
             })
             .collect()
     }

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::{
     AppInstanceId, AppObservation, NativeObservation, Placement, Reconciliation, Settings, macos,
@@ -22,12 +22,21 @@ pub fn add_absent_applications_with(
     mut is_running: impl FnMut(&AppInstanceId) -> bool,
     mut has_window_server_evidence: impl FnMut(&AppInstanceId) -> bool,
 ) {
-    let mut present = HashSet::with_capacity(observation.applications.len());
+    let mut present: crate::model::FastHashSet<AppInstanceId> =
+        crate::model::FastHashSet::with_capacity_and_hasher(
+            observation.applications.len(),
+            Default::default(),
+        );
     for app in &observation.applications {
         present.insert(app.app_id().clone());
-        if let AppObservation::Complete { app, .. } = app {
+        if let AppObservation::Complete { app, .. } = app
+            && known_apps.get(&app.id).map(String::as_str) != Some(app.bundle_id.as_str())
+        {
             known_apps.insert(app.id.clone(), app.bundle_id.clone());
         }
+    }
+    if known_apps.iter().all(|(app, _)| present.contains(app)) {
+        return;
     }
     let missing: Vec<_> = known_apps
         .iter()

@@ -23,9 +23,28 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     .into_iter()
                     .map(|workspace| {
                         let mut apps = Vec::new();
-                        for window in self.workspaces.windows(workspace) {
-                            if !apps.contains(&window.app.pid) {
+                        let engine = self.workspaces.engine(workspace);
+                        engine.layout().for_each_slot(&mut |slot_id| {
+                            if let Some(window) = engine
+                                .slot_by_id(slot_id)
+                                .and_then(crate::Slot::bound_window)
+                                && !apps.contains(&window.app.pid)
+                            {
                                 apps.push(window.app.pid);
+                            }
+                        });
+                        if self.workspaces.has_floating() {
+                            let mut floats: Vec<_> = self
+                                .workspaces
+                                .floating_entries()
+                                .filter(|(_, owner)| *owner == workspace)
+                                .map(|(window, _)| window)
+                                .collect();
+                            floats.sort();
+                            for window in floats {
+                                if !apps.contains(&window.app.pid) {
+                                    apps.push(window.app.pid);
+                                }
                             }
                         }
                         status_item::MenuWorkspace {

@@ -455,3 +455,44 @@ fn every_anomaly_kind_has_prose_meaning_distinct_from_its_label() {
         assert!(kind.meaning().contains(' '), "expected prose for {kind:?}");
     }
 }
+
+#[test]
+fn diff_sorted_fast_path_matches_unsorted_fallback_across_changes() {
+    let win = |id: u32, x: i32| ArrangedWindow {
+        window: id,
+        pid: 1,
+        bundle_id: "com.example.App".into(),
+        frame: Some(Rect {
+            x,
+            y: 0,
+            width: 400,
+            height: 300,
+        }),
+        owner: Some(WorkspaceId::ONE),
+        role: WindowRole::Tiled,
+        parked: false,
+    };
+    let before_sorted = Arrangement {
+        displays: vec![],
+        active: vec![WorkspaceId::ONE],
+        windows: vec![win(1, 0), win(2, 100), win(4, 200)],
+    };
+    let after_sorted = Arrangement {
+        displays: vec![],
+        active: vec![WorkspaceId::ONE],
+        windows: vec![win(1, 0), win(3, 150), win(4, 250)],
+    };
+    let before_unsorted = Arrangement {
+        windows: vec![win(4, 200), win(1, 0), win(2, 100)],
+        ..before_sorted.clone()
+    };
+    let after_unsorted = Arrangement {
+        windows: vec![win(4, 250), win(3, 150), win(1, 0)],
+        ..after_sorted.clone()
+    };
+    assert_eq!(diff(&before_sorted, &before_sorted), None);
+    assert_eq!(
+        diff(&before_sorted, &after_sorted),
+        diff(&before_unsorted, &after_unsorted)
+    );
+}

@@ -620,3 +620,62 @@ fn moving_into_a_populated_workspace_avoids_slot_id_collisions() {
     assert_eq!(ids.len(), 2);
     workspaces.engine(target).model().validate().unwrap();
 }
+
+#[test]
+fn state_revision_signature_changes_on_every_persisted_mutation() {
+    let mut workspaces = Workspaces::default();
+    let mut prev_sig = workspaces.state_revision_signature();
+    let mut prev_state = workspaces.state();
+
+    let assert_changed = |ws: &Workspaces, prev_sig: &mut _, prev_state: &mut _| {
+        let sig = ws.state_revision_signature();
+        let state = ws.state();
+        assert_ne!(state, *prev_state, "expected WorkspaceState to change");
+        assert_ne!(
+            sig, *prev_sig,
+            "revision signature missed a WorkspaceState change"
+        );
+        *prev_sig = sig;
+        *prev_state = state;
+    };
+
+    let w1 = PhysicalWindowId {
+        app: AppInstanceId {
+            pid: 1,
+            launched_at: 1,
+        },
+        window_id: 10,
+    };
+    let w2 = PhysicalWindowId {
+        app: AppInstanceId {
+            pid: 1,
+            launched_at: 1,
+        },
+        window_id: 11,
+    };
+    workspaces.engine_mut(WorkspaceId::ONE).insert_slot(Slot {
+        id: SlotId(1),
+        weight: 1,
+        binding: BindingState::Bound(w1.clone()),
+    });
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+    assert_eq!(workspaces.workspace_of(&w1), Some(WorkspaceId::ONE));
+    assert!(workspaces.has_windows(WorkspaceId::ONE));
+
+    workspaces.remember_focus(WorkspaceId::ONE, &w1);
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+
+    workspaces.set_fullscreen_layout(WorkspaceId::ONE, true);
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+
+    workspaces.own_floating(w2.clone(), WorkspaceId::new(2).unwrap());
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+    assert!(workspaces.has_windows(WorkspaceId::new(2).unwrap()));
+
+    workspaces.switch(WorkspaceId::new(2).unwrap());
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+
+    workspaces.forget_floating(&w2);
+    assert_changed(&workspaces, &mut prev_sig, &mut prev_state);
+    assert!(!workspaces.has_windows(WorkspaceId::new(2).unwrap()));
+}

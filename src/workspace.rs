@@ -169,10 +169,12 @@ pub struct Workspaces {
     active: HashMap<DisplaySelector, WorkspaceId>,
     previous: HashMap<DisplaySelector, WorkspaceId>,
     floating_owners: HashMap<PhysicalWindowId, WorkspaceId>,
+    floating_counts: [usize; WorkspaceId::COUNT],
     enabled: HashSet<WorkspaceId>,
     last_focused: [Option<crate::SlotId>; WorkspaceId::COUNT],
     last_focused_float: [Option<PhysicalWindowId>; WorkspaceId::COUNT],
     fullscreen_layout: [bool; WorkspaceId::COUNT],
+    meta_revision: u64,
 }
 
 impl Default for Workspaces {
@@ -188,15 +190,29 @@ impl Default for Workspaces {
             ]),
             previous: HashMap::new(),
             floating_owners: HashMap::new(),
+            floating_counts: [0; WorkspaceId::COUNT],
             enabled: WorkspaceId::numbered().collect(),
             last_focused: std::array::from_fn(|_| None),
             last_focused_float: std::array::from_fn(|_| None),
             fullscreen_layout: [false; WorkspaceId::COUNT],
+            meta_revision: 0,
         }
     }
 }
 
 impl Workspaces {
+    #[inline]
+    fn bump_meta_revision(&mut self) {
+        self.meta_revision = self.meta_revision.saturating_add(1);
+    }
+
+    /// Exact revision signature covering every field included in [`WorkspaceState`].
+    /// Unchanged signatures guarantee `self.state()` is identical without allocating.
+    #[must_use]
+    pub(crate) fn state_revision_signature(&self) -> (u64, [u64; WorkspaceId::COUNT]) {
+        let engine_revs = std::array::from_fn(|index| self.engines[index].persisted_revision());
+        (self.meta_revision, engine_revs)
+    }
     #[must_use]
     pub(crate) fn state(&self) -> WorkspaceState {
         let workspace_count = self
@@ -273,7 +289,10 @@ impl Workspaces {
         }
         for (window, workspace) in floating {
             if self.workspace_of(&window).is_none() {
-                self.floating_owners.insert(window, workspace);
+                if let Some(previous) = self.floating_owners.insert(window, workspace) {
+                    self.floating_counts[previous.index()] -= 1;
+                }
+                self.floating_counts[workspace.index()] += 1;
             }
         }
         for index in 0..WorkspaceId::COUNT {
@@ -293,6 +312,7 @@ impl Workspaces {
                     || legacy_maximized.is_some(),
             );
         }
+        self.bump_meta_revision();
     }
 
     #[must_use]
@@ -341,6 +361,7 @@ impl Workspaces {
         }) {
             self.previous.remove(&previous);
         }
+        self.bump_meta_revision();
     }
 
     /// Moves `workspace` to `target`, making it active there (recording any
@@ -407,6 +428,7 @@ impl Workspaces {
         }) {
             self.previous.remove(&source);
         }
+        self.bump_meta_revision();
     }
 
     pub fn enable(&mut self, workspace: WorkspaceId) {
@@ -424,6 +446,7 @@ impl Workspaces {
         if active != workspace {
             self.previous.insert(display.clone(), active);
             self.active.insert(display, workspace);
+            self.bump_meta_revision();
         }
         active
     }
@@ -431,7 +454,9 @@ impl Workspaces {
     /// Records `shown` as `display`'s previous workspace: a move covered it
     /// there though another selector naming the same display assigns it.
     pub fn set_previous(&mut self, display: DisplaySelector, shown: WorkspaceId) {
-        self.previous.insert(display, shown);
+        if self.previous.insert(display, shown) != Some(shown) {
+            self.bump_meta_revision();
+        }
     }
 
     #[must_use]
@@ -497,14 +522,7 @@ impl Workspaces {
     pub fn workspace_of(&self, window: &PhysicalWindowId) -> Option<WorkspaceId> {
         self.engines
             .iter()
-            .position(|engine| {
-                engine
-                    .model()
-                    .workspace
-                    .slots
-                    .iter()
-                    .any(|slot| slot.identity_window() == window)
-            })
+            .position(|engine| !engine.is_empty() && engine.owns_window(window))
             .map(WorkspaceId::from_index)
     }
 
@@ -514,31 +532,63 @@ impl Workspaces {
     }
 
     #[must_use]
+    pub(crate) fn has_floating(&self) -> bool {
+        !self.floating_owners.is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn has_tiled_windows(&self, workspace: WorkspaceId) -> bool {
+        !self.engines[workspace.index()].is_empty()
+    }
+
+    #[must_use]
+    pub(crate) fn has_windows(&self, workspace: WorkspaceId) -> bool {
+        let index = workspace.index();
+        !self.engines[index].is_empty() || self.floating_counts[index] > 0
+    }
+
+    #[must_use]
+    pub(crate) fn has_inactive_windows(&self, visible: &[WorkspaceId]) -> bool {
+        WorkspaceId::all().any(|workspace| {
+            self.is_enabled(workspace)
+                && !visible.contains(&workspace)
+                && self.has_windows(workspace)
+        })
+    }
+
+    #[must_use]
     pub(crate) fn workspace_of_any(&self, window: &PhysicalWindowId) -> Option<WorkspaceId> {
         self.workspace_of(window)
             .or_else(|| self.floating_workspace_of(window))
     }
 
     pub(crate) fn own_floating(&mut self, window: PhysicalWindowId, workspace: WorkspaceId) {
-        if let Some(previous) = self.floating_owners.insert(window.clone(), workspace)
-            && previous != workspace
-            && self.last_focused_float[previous.index()].as_ref() == Some(&window)
-        {
-            self.last_focused_float[previous.index()] = None;
+        let previous = self.floating_owners.insert(window.clone(), workspace);
+        if previous != Some(workspace) {
+            if let Some(prev_ws) = previous {
+                self.floating_counts[prev_ws.index()] -= 1;
+                if self.last_focused_float[prev_ws.index()].as_ref() == Some(&window) {
+                    self.last_focused_float[prev_ws.index()] = None;
+                }
+            }
+            self.floating_counts[workspace.index()] += 1;
+            self.bump_meta_revision();
         }
     }
 
     /// The workspace's tiles in stable tile order, then its floats in a stable
     /// (app instance, window id) order so callers can walk them predictably.
     pub(crate) fn windows(&self, workspace: WorkspaceId) -> Vec<PhysicalWindowId> {
-        let mut floats: Vec<_> = self
-            .floating_entries()
-            .filter(|(_, owner)| *owner == workspace)
-            .map(|(window, _)| window.clone())
-            .collect();
-        floats.sort();
         let mut windows = self.engine(workspace).bound_windows();
-        windows.extend(floats);
+        if self.floating_counts[workspace.index()] > 0 {
+            let mut floats: Vec<_> = self
+                .floating_entries()
+                .filter(|(_, owner)| *owner == workspace)
+                .map(|(window, _)| window.clone())
+                .collect();
+            floats.sort();
+            windows.extend(floats);
+        }
         windows
     }
 
@@ -555,7 +605,9 @@ impl Workspaces {
     }
 
     pub(crate) fn app_owns_tiled_windows(&self, app: &crate::AppInstanceId) -> bool {
-        WorkspaceId::all().any(|workspace| self.app_instances(workspace).any(|owner| owner == app))
+        self.engines
+            .iter()
+            .any(|engine| !engine.is_empty() && engine.owns_app(app))
     }
 
     pub(crate) fn app_owns_windows(&self, app: &crate::AppInstanceId) -> bool {
@@ -598,10 +650,12 @@ impl Workspaces {
     }
 
     pub(crate) fn forget_floating(&mut self, window: &PhysicalWindowId) {
-        if let Some(workspace) = self.floating_owners.remove(window)
-            && self.last_focused_float[workspace.index()].as_ref() == Some(window)
-        {
-            self.last_focused_float[workspace.index()] = None;
+        if let Some(workspace) = self.floating_owners.remove(window) {
+            self.floating_counts[workspace.index()] -= 1;
+            if self.last_focused_float[workspace.index()].as_ref() == Some(window) {
+                self.last_focused_float[workspace.index()] = None;
+            }
+            self.bump_meta_revision();
         }
     }
 
@@ -611,16 +665,11 @@ impl Workspaces {
     pub fn workspace_for_app(&self, app: &crate::AppInstanceId) -> Option<WorkspaceId> {
         let mut matches = WorkspaceId::all().filter(|workspace| {
             self.is_enabled(*workspace)
-                && (self
-                    .engine(*workspace)
-                    .model()
-                    .workspace
-                    .slots
-                    .iter()
-                    .any(|slot| slot.belongs_to(app))
-                    || self
-                        .floating_entries()
-                        .any(|(window, owner)| owner == *workspace && &window.app == app))
+                && (self.engine(*workspace).owns_app(app)
+                    || (self.floating_counts[workspace.index()] > 0
+                        && self
+                            .floating_entries()
+                            .any(|(window, owner)| owner == *workspace && &window.app == app)))
         });
         let workspace = matches.next()?;
         matches.next().is_none().then_some(workspace)
@@ -670,8 +719,12 @@ impl Workspaces {
     /// float records it without overwriting the remembered tile (#138, #240).
     pub(crate) fn remember_focus(&mut self, workspace: WorkspaceId, window: &PhysicalWindowId) {
         if let Some(slot) = self.engine(workspace).slot_for_window(window) {
-            self.last_focused[workspace.index()] = Some(slot);
-            self.last_focused_float[workspace.index()] = None;
+            let index = workspace.index();
+            if self.last_focused[index] != Some(slot) {
+                self.last_focused[index] = Some(slot);
+                self.bump_meta_revision();
+            }
+            self.last_focused_float[index] = None;
         } else if self.floating_workspace_of(window) == Some(workspace) {
             self.last_focused_float[workspace.index()] = Some(window.clone());
         }
@@ -689,8 +742,7 @@ impl Workspaces {
     pub(crate) fn preferred_focus(&self, workspace: WorkspaceId) -> Option<PhysicalWindowId> {
         let slot = self.last_focused[workspace.index()]?;
         self.engine(workspace)
-            .model()
-            .slot(slot)?
+            .slot_by_id(slot)?
             .bound_window()
             .cloned()
     }
@@ -700,19 +752,25 @@ impl Workspaces {
     }
 
     pub(crate) fn set_fullscreen_layout(&mut self, workspace: WorkspaceId, enabled: bool) {
-        self.fullscreen_layout[workspace.index()] =
-            enabled && !self.engine(workspace).model().workspace.slots.is_empty();
+        let next = enabled && !self.engine(workspace).is_empty();
+        if self.fullscreen_layout[workspace.index()] != next {
+            self.fullscreen_layout[workspace.index()] = next;
+            self.bump_meta_revision();
+        }
     }
 
     pub(crate) fn prune_intents(&mut self, workspace: WorkspaceId) {
         let index = workspace.index();
-        self.last_focused[index] =
-            self.last_focused[index].filter(|slot| self.has_slot(workspace, *slot));
+        let next_focused = self.last_focused[index].filter(|slot| self.has_slot(workspace, *slot));
+        if self.last_focused[index] != next_focused {
+            self.last_focused[index] = next_focused;
+            self.bump_meta_revision();
+        }
         self.set_fullscreen_layout(workspace, self.fullscreen_layout[index]);
     }
 
     fn has_slot(&self, workspace: WorkspaceId, slot: crate::SlotId) -> bool {
-        self.engine(workspace).model().slot(slot).is_some()
+        self.engine(workspace).slot_by_id(slot).is_some()
     }
 
     pub(crate) fn inactive_windows_except(
@@ -720,7 +778,11 @@ impl Workspaces {
         visible: &HashSet<WorkspaceId>,
     ) -> Vec<(WorkspaceId, PhysicalWindowId)> {
         WorkspaceId::all()
-            .filter(|workspace| self.is_enabled(*workspace) && !visible.contains(workspace))
+            .filter(|workspace| {
+                self.is_enabled(*workspace)
+                    && !visible.contains(workspace)
+                    && self.has_windows(*workspace)
+            })
             .flat_map(|workspace| {
                 self.windows(workspace)
                     .into_iter()

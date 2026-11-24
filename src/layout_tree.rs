@@ -143,9 +143,23 @@ impl LayoutTree {
     }
 
     pub(crate) fn slots(&self) -> Vec<SlotId> {
-        let mut slots = Vec::new();
+        let mut slots = Vec::with_capacity(self.leaf_count());
         collect_slots(&self.root, &mut slots);
         slots
+    }
+
+    pub(crate) fn for_each_slot(&self, f: &mut impl FnMut(SlotId)) {
+        visit_slots(&self.root, f);
+    }
+
+    pub(crate) fn leaf_count(&self) -> usize {
+        count_leaves(&self.root)
+    }
+
+    pub(crate) fn preview_rects(&self, frame: Rect) -> Vec<Rect> {
+        let mut rects = Vec::with_capacity(self.leaf_count());
+        place_rects(&self.root, frame, &mut rects);
+        rects
     }
 
     pub(crate) fn validate(&self, slots: &[crate::Slot]) -> Result<(), String> {
@@ -166,7 +180,7 @@ impl LayoutTree {
     }
 
     pub(crate) fn placements(&self, output: Rect) -> Vec<(SlotId, Rect)> {
-        let mut placements = Vec::new();
+        let mut placements = Vec::with_capacity(self.leaf_count());
         place(&self.root, output, &mut placements);
         placements
     }
@@ -703,57 +717,91 @@ fn leaf_weight(node: &Node, slot: SlotId) -> Option<u32> {
     None
 }
 
-fn place(node: &Node, frame: Rect, placements: &mut Vec<(SlotId, Rect)>) {
+fn visit_slots(node: &Node, f: &mut impl FnMut(SlotId)) {
     match node {
-        Node::Leaf(slot) => placements.push((*slot, frame)),
-        Node::Split { axis, children, .. } => {
-            for (child, child_frame) in children
-                .iter()
-                .zip(partition_children(frame, *axis, children))
-            {
-                place(&child.node, child_frame, placements);
+        Node::Leaf(slot) => f(*slot),
+        Node::Split { children, .. } => {
+            for child in children {
+                visit_slots(&child.node, f);
             }
         }
     }
 }
 
-fn partition_children(frame: Rect, axis: Axis, children: &[Child]) -> Vec<Rect> {
+fn count_leaves(node: &Node) -> usize {
+    match node {
+        Node::Leaf(_) => 1,
+        Node::Split { children, .. } => children.iter().map(|c| count_leaves(&c.node)).sum(),
+    }
+}
+
+fn for_each_child_rect(
+    frame: Rect,
+    axis: Axis,
+    children: &[Child],
+    mut f: impl FnMut(&Child, Rect),
+) {
     let total = children
         .iter()
         .map(|child| u64::from(child.weight))
         .sum::<u64>();
     if total == 0 {
-        return Vec::new();
+        return;
     }
     let length = extent(frame, axis);
     let mut cursor = 0;
     let mut cumulative = 0_u64;
-    children
-        .iter()
-        .enumerate()
-        .map(|(index, child)| {
-            cumulative += u64::from(child.weight);
-            let end = if index + 1 == children.len() {
-                length
-            } else {
-                (i64::from(length) * cumulative as i64 / total as i64) as i32
-            };
-            let result = match axis {
-                Axis::Horizontal => Rect {
-                    x: frame.x + cursor,
-                    width: end - cursor,
-                    ..frame
-                },
-                Axis::Vertical => Rect {
-                    y: frame.y + cursor,
-                    height: end - cursor,
-                    ..frame
-                },
-            };
-            cursor = end;
-            result
-        })
-        .collect()
+    let last = children.len().saturating_sub(1);
+    for (index, child) in children.iter().enumerate() {
+        cumulative += u64::from(child.weight);
+        let end = if index == last {
+            length
+        } else {
+            (i64::from(length) * cumulative as i64 / total as i64) as i32
+        };
+        let child_frame = match axis {
+            Axis::Horizontal => Rect {
+                x: frame.x + cursor,
+                width: end - cursor,
+                ..frame
+            },
+            Axis::Vertical => Rect {
+                y: frame.y + cursor,
+                height: end - cursor,
+                ..frame
+            },
+        };
+        cursor = end;
+        f(child, child_frame);
+    }
+}
+
+fn place(node: &Node, frame: Rect, placements: &mut Vec<(SlotId, Rect)>) {
+    match node {
+        Node::Leaf(slot) => placements.push((*slot, frame)),
+        Node::Split { axis, children, .. } => {
+            for_each_child_rect(frame, *axis, children, |child, child_frame| {
+                place(&child.node, child_frame, placements);
+            });
+        }
+    }
+}
+
+fn place_rects(node: &Node, frame: Rect, rects: &mut Vec<Rect>) {
+    match node {
+        Node::Leaf(_) => rects.push(frame),
+        Node::Split { axis, children, .. } => {
+            for_each_child_rect(frame, *axis, children, |child, child_frame| {
+                place_rects(&child.node, child_frame, rects);
+            });
+        }
+    }
+}
+
+fn partition_children(frame: Rect, axis: Axis, children: &[Child]) -> Vec<Rect> {
+    let mut rects = Vec::with_capacity(children.len());
+    for_each_child_rect(frame, axis, children, |_, rect| rects.push(rect));
+    rects
 }
 
 const fn extent(frame: Rect, axis: Axis) -> i32 {

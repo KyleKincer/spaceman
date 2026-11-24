@@ -17,7 +17,7 @@ pub(super) enum FrozenWindowAffinity {
 }
 
 pub(super) struct FrozenAffinityPolicy {
-    pub(super) windows: HashMap<crate::PhysicalWindowId, FrozenWindowAffinity>,
+    pub(super) windows: crate::model::FastHashMap<crate::PhysicalWindowId, FrozenWindowAffinity>,
     pub(super) visible_workspaces: HashSet<WorkspaceId>,
 }
 
@@ -29,16 +29,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         frontmost: Option<&AppInstanceId>,
         server_frames: &HashMap<u32, crate::Rect>,
     ) -> Result<FrozenAffinityPolicy, String> {
-        let observed_running: HashSet<&AppInstanceId> = observation
-            .applications
-            .iter()
-            .filter_map(|app| match app {
-                crate::AppObservation::Complete { app, .. } => Some(&app.id),
-                crate::AppObservation::Unavailable { app, .. } => Some(app),
-                crate::AppObservation::Terminated { .. } => None,
-            })
-            .collect();
-        let has_floating = self.workspaces.floating_entries().next().is_some();
+        let mut observed_running: crate::model::FastHashSet<&AppInstanceId> =
+            crate::model::FastHashSet::with_capacity_and_hasher(
+                observation.applications.len(),
+                Default::default(),
+            );
+        let mut total_windows = 0usize;
+        for app in &observation.applications {
+            match app {
+                crate::AppObservation::Complete { app, windows, .. } => {
+                    observed_running.insert(&app.id);
+                    total_windows += windows.len();
+                }
+                crate::AppObservation::Unavailable { app, .. } => {
+                    observed_running.insert(app);
+                }
+                crate::AppObservation::Terminated { .. } => {}
+            }
+        }
+        let has_floating = self.workspaces.has_floating();
         if has_floating {
             let floating_apps = self
                 .workspaces
@@ -61,7 +70,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         // process can appear in the same observation that reports the old
         // one terminated.
         self.note_absent_departures(observation);
-        let mut affinities = HashMap::new();
+        let mut affinities: crate::model::FastHashMap<
+            crate::PhysicalWindowId,
+            FrozenWindowAffinity,
+        > = crate::model::FastHashMap::with_capacity_and_hasher(total_windows, Default::default());
         // Read once, and only if a Complete snapshot omits an owned float.
         let mut onscreen_frames = None;
         for application in &observation.applications {
@@ -86,17 +98,19 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             let mut app_owns_window = self.workspaces.app_owns_windows(&app.id);
             let mut app_owns_tiled = self.workspaces.app_owns_tiled_windows(&app.id);
             for window in windows {
-                self.heal_reappeared_window(window, visible, frontmost, server_frames);
-                if self.parked.contains_key(&window.id)
-                    && self
-                        .scratchpad
-                        .entry(&window.id)
-                        .is_some_and(|entry| entry.shown_on.is_none())
-                {
-                    // Still hidden in the scratchpad (re-parked or settling); only an
-                    // honored reappearance clears its parked record and lets it adopt.
-                    affinities.insert(window.id.clone(), FrozenWindowAffinity::Ignored);
-                    continue;
+                if !self.parked.is_empty() {
+                    self.heal_reappeared_window(window, visible, frontmost, server_frames);
+                    if self.parked.contains_key(&window.id)
+                        && self
+                            .scratchpad
+                            .entry(&window.id)
+                            .is_some_and(|entry| entry.shown_on.is_none())
+                    {
+                        // Still hidden in the scratchpad (re-parked or settling); only an
+                        // honored reappearance clears its parked record and lets it adopt.
+                        affinities.insert(window.id.clone(), FrozenWindowAffinity::Ignored);
+                        continue;
+                    }
                 }
                 let disposition = self.config.disposition(&app.bundle_id, window);
                 if disposition == WindowDisposition::Ignored {
@@ -121,19 +135,22 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 // close or save sheet disables its fullscreen button or AXSize),
                 // and a tile rule tiles it whatever it looks like. A float rule or
                 // Toggle Float still releases the tile immediately.
-                let tiled = self.workspaces.workspace_of(&window.id).is_some();
+                let mut tiled_owner = self.workspaces.workspace_of(&window.id);
+                let tiled = tiled_owner.is_some();
                 let floating = disposition == WindowDisposition::Floating
                     || self.manual_floating.contains(&window.id)
                     || (!window.resizable && !tiled && disposition != WindowDisposition::Tiled);
                 if floating {
-                    if let Some(owner) = self.workspaces.workspace_of(&window.id) {
+                    if let Some(owner) = tiled_owner.take() {
                         self.forget_window(owner, &window.id);
                         self.workspaces.own_floating(window.id.clone(), owner);
                     }
-                } else if self.workspaces.floating_workspace_of(&window.id).is_some() {
+                } else if has_floating
+                    && self.workspaces.floating_workspace_of(&window.id).is_some()
+                {
                     self.workspaces.forget_floating(&window.id);
                 }
-                let affinity = if let Some(owner) = self.workspaces.workspace_of(&window.id) {
+                let affinity = if let Some(owner) = tiled_owner {
                     FrozenWindowAffinity::Owned(owner)
                 } else if !floating
                     && let Some(affinity) = {
@@ -246,13 +263,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     fn forget_exited_apps_on_hidden_workspaces(
         &mut self,
         visible: &[ResolvedWorkspace],
-        observed_running: &HashSet<&AppInstanceId>,
+        observed_running: &crate::model::FastHashSet<&AppInstanceId>,
     ) {
         let mut running = HashMap::new();
         for workspace in WorkspaceId::all() {
-            if visible
-                .iter()
-                .any(|resolved| resolved.workspace == workspace)
+            if !self.workspaces.has_tiled_windows(workspace)
+                || visible
+                    .iter()
+                    .any(|resolved| resolved.workspace == workspace)
             {
                 continue;
             }

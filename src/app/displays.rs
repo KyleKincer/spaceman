@@ -57,6 +57,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// Record the current displays. When they differ from the last ones, every
     /// parked window is due a re-park against them.
     pub(super) fn note_outputs(&mut self, outputs: &macos::DisplayOutputs) {
+        if self.displays.known.as_ref() == Some(outputs) {
+            return;
+        }
         if self
             .displays
             .known

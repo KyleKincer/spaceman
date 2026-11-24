@@ -200,34 +200,90 @@ pub struct WindowChange {
 /// The diff from `before` to `after`, or `None` when nothing material changed.
 #[must_use]
 pub fn diff(before: &Arrangement, after: &Arrangement) -> Option<JournalEvent> {
-    let old: BTreeMap<_, _> = before.windows.iter().map(|w| (w.window, w)).collect();
-    let new: BTreeMap<_, _> = after.windows.iter().map(|w| (w.window, w)).collect();
     let mut changes = Vec::new();
-    for (id, previous) in &old {
-        match new.get(id) {
-            None => changes.push(WindowChange {
-                window: *id,
-                before: Some((*previous).clone()),
-                after: None,
-            }),
-            Some(current) if previous.differs(current) => changes.push(WindowChange {
-                window: *id,
-                before: Some((*previous).clone()),
-                after: Some((*current).clone()),
-            }),
-            Some(_) => {}
+    let sorted_unique = |windows: &[ArrangedWindow]| {
+        windows
+            .windows(2)
+            .all(|pair| pair[0].window < pair[1].window)
+    };
+    if sorted_unique(&before.windows) && sorted_unique(&after.windows) {
+        let (mut i, mut j) = (0, 0);
+        while i < before.windows.len() && j < after.windows.len() {
+            let previous = &before.windows[i];
+            let current = &after.windows[j];
+            match previous.window.cmp(&current.window) {
+                std::cmp::Ordering::Less => {
+                    changes.push(WindowChange {
+                        window: previous.window,
+                        before: Some(previous.clone()),
+                        after: None,
+                    });
+                    i += 1;
+                }
+                std::cmp::Ordering::Greater => {
+                    changes.push(WindowChange {
+                        window: current.window,
+                        before: None,
+                        after: Some(current.clone()),
+                    });
+                    j += 1;
+                }
+                std::cmp::Ordering::Equal => {
+                    if previous.differs(current) {
+                        changes.push(WindowChange {
+                            window: previous.window,
+                            before: Some(previous.clone()),
+                            after: Some(current.clone()),
+                        });
+                    }
+                    i += 1;
+                    j += 1;
+                }
+            }
         }
-    }
-    for (id, current) in &new {
-        if !old.contains_key(id) {
+        for previous in &before.windows[i..] {
             changes.push(WindowChange {
-                window: *id,
-                before: None,
-                after: Some((*current).clone()),
+                window: previous.window,
+                before: Some(previous.clone()),
+                after: None,
             });
         }
+        for current in &after.windows[j..] {
+            changes.push(WindowChange {
+                window: current.window,
+                before: None,
+                after: Some(current.clone()),
+            });
+        }
+    } else {
+        let old: BTreeMap<_, _> = before.windows.iter().map(|w| (w.window, w)).collect();
+        let new: BTreeMap<_, _> = after.windows.iter().map(|w| (w.window, w)).collect();
+        for (id, previous) in &old {
+            match new.get(id) {
+                None => changes.push(WindowChange {
+                    window: *id,
+                    before: Some((*previous).clone()),
+                    after: None,
+                }),
+                Some(current) if previous.differs(current) => changes.push(WindowChange {
+                    window: *id,
+                    before: Some((*previous).clone()),
+                    after: Some((*current).clone()),
+                }),
+                Some(_) => {}
+            }
+        }
+        for (id, current) in &new {
+            if !old.contains_key(id) {
+                changes.push(WindowChange {
+                    window: *id,
+                    before: None,
+                    after: Some((*current).clone()),
+                });
+            }
+        }
+        changes.sort_by_key(|change| change.window);
     }
-    changes.sort_by_key(|change| change.window);
     let active = (before.active != after.active).then(|| after.active.clone());
     let displays = (before.displays != after.displays).then(|| after.displays.clone());
     (active.is_some() || displays.is_some() || !changes.is_empty()).then_some(JournalEvent::Diff {

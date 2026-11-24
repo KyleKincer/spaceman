@@ -90,11 +90,6 @@ impl Default for Model {
 }
 
 impl Model {
-    #[must_use]
-    pub(crate) fn slot(&self, id: SlotId) -> Option<&Slot> {
-        self.workspace.slots.iter().find(|slot| slot.id == id)
-    }
-
     pub fn validate(&self) -> Result<(), String> {
         let mut slot_ids = std::collections::HashSet::new();
         let mut windows = std::collections::HashSet::new();
@@ -142,3 +137,63 @@ impl Model {
         Ok(())
     }
 }
+
+/// Fast non-cryptographic hasher (FxHash) for internal window/slot ID maps
+/// whose keys come from trusted local macOS PIDs and CGWindowIDs.
+#[derive(Default)]
+pub(crate) struct FastHasher(u64);
+
+const FX_K: u64 = 0x517c_c1b7_2722_0a95;
+
+impl FastHasher {
+    #[inline]
+    fn mix(&mut self, word: u64) {
+        self.0 = (self.0.rotate_left(5) ^ word).wrapping_mul(FX_K);
+    }
+}
+
+impl std::hash::Hasher for FastHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, mut bytes: &[u8]) {
+        while let Some((chunk, rest)) = bytes.split_first_chunk::<8>() {
+            self.mix(u64::from_ne_bytes(*chunk));
+            bytes = rest;
+        }
+        if let Some((chunk, rest)) = bytes.split_first_chunk::<4>() {
+            self.mix(u64::from(u32::from_ne_bytes(*chunk)));
+            bytes = rest;
+        }
+        for &byte in bytes {
+            self.mix(u64::from(byte));
+        }
+    }
+
+    #[inline]
+    fn write_u32(&mut self, i: u32) {
+        self.mix(u64::from(i));
+    }
+
+    #[inline]
+    fn write_i32(&mut self, i: i32) {
+        self.mix(i as u32 as u64);
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, i: usize) {
+        self.mix(i as u64);
+    }
+}
+
+pub(crate) type FastBuildHasher = std::hash::BuildHasherDefault<FastHasher>;
+pub(crate) type FastHashMap<K, V> = HashMap<K, V, FastBuildHasher>;
+pub(crate) type FastHashSet<K> = std::collections::HashSet<K, FastBuildHasher>;
