@@ -299,13 +299,16 @@ impl Doc {
     /// Sets `key` in `[settings]`, or removes it (and an emptied table) for `None`, the default.
     fn set_setting(&mut self, key: &str, item: Option<Item>) {
         let Some(item) = item else {
-            let empty =
-                if let Some(table) = self.doc.get_mut("settings").and_then(Item::as_table_mut) {
-                    table.remove(key);
-                    table.is_empty()
-                } else {
-                    false
-                };
+            let empty = if let Some(table) = self
+                .doc
+                .get_mut("settings")
+                .and_then(Item::as_table_like_mut)
+            {
+                table.remove(key);
+                table.is_empty()
+            } else {
+                false
+            };
             if empty {
                 self.remove_table("settings");
             }
@@ -315,10 +318,10 @@ impl Doc {
             .doc
             .entry("settings")
             .or_insert_with(|| Item::Table(Table::new()));
-        if !entry.is_table() {
+        if !entry.is_table_like() {
             *entry = Item::Table(Table::new());
         }
-        if let Some(table) = entry.as_table_mut() {
+        if let Some(table) = entry.as_table_like_mut() {
             set_table_item(table, key, item);
         }
     }

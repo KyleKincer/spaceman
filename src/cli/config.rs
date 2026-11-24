@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use spaceman::{
     config::{HudPosition, HudStyle, MouseFollowsFocus, UpdateChannel, load_path},
-    spacing::SpacingKey,
+    spacing::{self, SpacingKey},
 };
 
 use super::{
@@ -57,6 +57,7 @@ enum SettingKey {
     HudPosition,
     UpdateChannel,
     MouseFollowsFocus,
+    Outer,
     Spacing(SpacingKey),
 }
 
@@ -68,11 +69,12 @@ impl SettingKey {
             "hud_position" => Ok(Self::HudPosition),
             "update_channel" => Ok(Self::UpdateChannel),
             "mouse_follows_focus" => Ok(Self::MouseFollowsFocus),
+            spacing::OUTER => Ok(Self::Outer),
             other => SpacingKey::parse(other).map(Self::Spacing).ok_or_else(|| {
                 format!(
                     "unknown setting {raw:?}; valid keys: hud, hud_style, hud_position, \
-                     update_channel, mouse_follows_focus, gaps.inner, gaps.top, gaps.bottom, \
-                     gaps.left, gaps.right, single_window_max_width"
+                     update_channel, mouse_follows_focus, gaps.inner, gaps.outer, gaps.top, \
+                     gaps.bottom, gaps.left, gaps.right, single_window_max_width"
                 )
             }),
         }
@@ -85,6 +87,7 @@ impl SettingKey {
             Self::HudPosition => "hud_position",
             Self::UpdateChannel => "update_channel",
             Self::MouseFollowsFocus => "mouse_follows_focus",
+            Self::Outer => spacing::OUTER,
             Self::Spacing(key) => key.path(),
         }
     }
@@ -121,6 +124,10 @@ impl SettingKey {
                 let mode = settings.effective_mouse_follows_focus().as_str();
                 (mode.to_owned(), serde_json::Value::String(mode.to_owned()))
             }
+            Self::Outer => {
+                let value = settings.effective_outer();
+                (value.to_string(), serde_json::Value::from(value))
+            }
             Self::Spacing(key) => {
                 let value = key.get(&settings.effective_spacing());
                 (value.to_string(), serde_json::Value::from(value))
@@ -128,7 +135,7 @@ impl SettingKey {
         }
     }
 
-    /// Whether the file sets this key at all; a spacing key at `0` is already the default.
+    /// Whether the file sets this key at all.
     fn is_set(self, settings: &SettingsDoc) -> bool {
         match self {
             Self::Hud => settings.hud.is_some(),
@@ -136,7 +143,8 @@ impl SettingKey {
             Self::HudPosition => settings.hud_position.is_some(),
             Self::UpdateChannel => settings.update_channel.is_some(),
             Self::MouseFollowsFocus => settings.mouse_follows_focus.is_some(),
-            Self::Spacing(key) => key.get(&settings.effective_spacing()) != 0,
+            Self::Outer => settings.gaps.outer.is_some(),
+            Self::Spacing(key) => settings.has_spacing(key),
         }
     }
 
@@ -148,11 +156,8 @@ impl SettingKey {
             Self::HudPosition => settings.hud_position = None,
             Self::UpdateChannel => settings.update_channel = None,
             Self::MouseFollowsFocus => settings.mouse_follows_focus = None,
-            Self::Spacing(key) => {
-                // `0` is always in range, so this only removes the key.
-                let cleared = settings.set_spacing(key, 0);
-                debug_assert!(cleared.is_ok(), "0 is a valid spacing value");
-            }
+            Self::Outer => settings.gaps.outer = None,
+            Self::Spacing(key) => settings.clear_spacing(key),
         }
     }
 }
@@ -275,6 +280,7 @@ enum SettingValue {
     HudPosition(HudPosition),
     UpdateChannel(UpdateChannel),
     MouseFollowsFocus(MouseFollowsFocus),
+    Outer(i64),
     Spacing(SpacingKey, i64),
 }
 
@@ -316,13 +322,13 @@ impl SettingValue {
                         "invalid value for mouse_follows_focus: expected 'off', 'display', or 'window', got {raw_value:?}"
                     )
                 }),
+            SettingKey::Outer => {
+                let parsed = parse_points(key, raw_value)?;
+                spacing::check_outer(parsed)?;
+                Ok(Self::Outer(parsed))
+            }
             SettingKey::Spacing(spacing_key) => {
-                let parsed = raw_value.parse::<i64>().map_err(|_| {
-                    format!(
-                        "invalid value for {}: expected a whole number of points, got {raw_value:?}",
-                        spacing_key.path()
-                    )
-                })?;
+                let parsed = parse_points(key, raw_value)?;
                 spacing_key.check(parsed)?;
                 Ok(Self::Spacing(spacing_key, parsed))
             }
@@ -376,10 +382,17 @@ fn run_set(args: &[&str], path_override: Option<&Path>) -> Result<String, String
                     serde_json::Value::String(parsed.as_str().to_owned()),
                 )
             }
+            SettingValue::Outer(parsed) => {
+                let value = doc.settings.set_outer(parsed)?;
+                (
+                    format!("set {} = {value}", key.as_str()),
+                    serde_json::Value::from(value),
+                )
+            }
             SettingValue::Spacing(spacing_key, parsed) => {
                 let value = doc.settings.set_spacing(spacing_key, parsed)?;
                 (
-                    format!("set {} = {value}", spacing_key.path()),
+                    format!("set {} = {value}", key.as_str()),
                     serde_json::Value::from(value),
                 )
             }
@@ -424,6 +437,15 @@ fn run_reset(args: &[&str], path_override: Option<&Path>) -> Result<String, Stri
     } else {
         Ok(text)
     }
+}
+
+fn parse_points(key: SettingKey, raw: &str) -> Result<i64, String> {
+    raw.parse().map_err(|_| {
+        format!(
+            "invalid value for {}: expected a whole number of points, got {raw:?}",
+            key.as_str()
+        )
+    })
 }
 
 fn run_check(args: &[&str], path_override: Option<&Path>) -> Result<String, String> {
