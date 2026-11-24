@@ -28,13 +28,10 @@ impl MainThreadAgent {
                     let ack = format!("opened {}", link.canonical_url());
                     self.queue_action(Action::OpenTarget(link.resolve()), &ack)
                 }
-                ControlCommand::Debug => self
-                    .latest_debug
-                    .as_ref()
-                    .ok_or_else(|| "runtime debug state is not ready".into())
-                    .and_then(|debug| {
-                        serde_json::to_string(debug).map_err(|error| error.to_string())
-                    }),
+                ControlCommand::Debug => {
+                    self.pending_debug.push(request);
+                    continue;
+                }
                 ControlCommand::Queue(ref action) if self.automatic => self.queue_action(
                     Action::Worker(action.clone()),
                     &action.queued_acknowledgement(),
@@ -58,6 +55,23 @@ impl MainThreadAgent {
                 ControlCommand::Quit => self.queue_action(Action::Quit, "quit queued"),
             };
             request.respond(response);
+        }
+        if !self.pending_debug.is_empty() && !self.worker.is_busy() {
+            match macos::outputs() {
+                Ok(outputs) => {
+                    if !self.worker.send(WorkerCommand::Debug(outputs)) {
+                        for request in self.pending_debug.drain(..) {
+                            request.respond(Err("workspace worker is unavailable".into()));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let message = format!("Display error: {error}");
+                    for request in self.pending_debug.drain(..) {
+                        request.respond(Err(message.clone()));
+                    }
+                }
+            }
         }
     }
 

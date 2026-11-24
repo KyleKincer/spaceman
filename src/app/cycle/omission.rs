@@ -132,15 +132,12 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         workspace: WorkspaceId,
         observation: &mut crate::NativeObservation,
-        onscreen_frames: Option<&HashMap<u32, crate::Rect>>,
+        onscreen_frames: &mut Option<Option<HashMap<u32, crate::Rect>>>,
         close_recheck: &mut Option<Instant>,
     ) {
         if observation.mouse_down {
             return;
         }
-        let Some(onscreen_frames) = onscreen_frames else {
-            return;
-        };
         let bound = self.workspaces.engine(workspace).bound_windows();
         if bound.is_empty() && self.omitted_windows.is_empty() {
             return;
@@ -152,6 +149,23 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 // An omitted float's settle is tracked by affinity freezing.
                 None => self.workspaces.floating_workspace_of(window).is_some(),
             });
+        let has_missing_complete = observation.applications.iter().any(|app_observation| {
+            let crate::AppObservation::Complete { app, .. } = app_observation else {
+                return false;
+            };
+            bound
+                .iter()
+                .any(|window| window.app == app.id && !observed.contains(window))
+        });
+        if !has_missing_complete {
+            return;
+        }
+        let Some(onscreen_frames) = onscreen_frames
+            .get_or_insert_with(|| self.backend.onscreen_window_frames())
+            .as_ref()
+        else {
+            return;
+        };
         let now = Instant::now();
         for app_observation in &mut observation.applications {
             let crate::AppObservation::Complete { app, .. } = app_observation else {
@@ -208,7 +222,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         workspace: WorkspaceId,
         observation: &crate::NativeObservation,
         server_frames: Option<&HashMap<u32, crate::Rect>>,
-        onscreen_frames: Option<&HashMap<u32, crate::Rect>>,
+        onscreen_frames: &mut Option<Option<HashMap<u32, crate::Rect>>>,
         close_recheck: &mut Option<Instant>,
     ) -> HashSet<AppInstanceId> {
         let mut apps = HashSet::new();
@@ -220,16 +234,6 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .iter()
             .map(|app| app.app_id().clone())
             .collect();
-        let observed = live::observed_frames(observation);
-        let mut observed_tiles = observed
-            .keys()
-            .filter(|window| self.workspaces.workspace_of(window) == Some(workspace))
-            .peekable();
-        let onscreen_frames = onscreen_frames.filter(|_| observed_tiles.peek().is_some());
-        // The newer CG snapshot must still show a sibling. A Space switch
-        // between the AX and CG reads can order out the entire workspace.
-        let sibling_on_screen = onscreen_frames
-            .is_some_and(|frames| observed_tiles.any(|tile| frames.contains_key(&tile.window_id)));
         let windows: Vec<_> = self
             .workspaces
             .engine(workspace)
@@ -251,6 +255,26 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 !present.contains(&window.app) && server_frames.contains_key(&window.window_id)
             })
             .collect();
+        if windows.is_empty() {
+            return apps;
+        }
+        let observed = live::observed_frames(observation);
+        let mut observed_tiles = observed
+            .keys()
+            .filter(|window| self.workspaces.workspace_of(window) == Some(workspace))
+            .peekable();
+        let has_observed_tile = observed_tiles.peek().is_some();
+        let onscreen_frames = if has_observed_tile && windows.iter().any(|(_, settles)| *settles) {
+            onscreen_frames
+                .get_or_insert_with(|| self.backend.onscreen_window_frames())
+                .as_ref()
+        } else {
+            None
+        };
+        // The newer CG snapshot must still show a sibling. A Space switch
+        // between the AX and CG reads can order out the entire workspace.
+        let sibling_on_screen = onscreen_frames
+            .is_some_and(|frames| observed_tiles.any(|tile| frames.contains_key(&tile.window_id)));
         let now = Instant::now();
         for (window, settles) in windows {
             let Some(onscreen_frames) = onscreen_frames.filter(|_| settles) else {

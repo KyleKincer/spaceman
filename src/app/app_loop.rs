@@ -122,7 +122,7 @@ pub struct MainThreadAgent {
     next_restore_retry: Option<Instant>,
     active_workspaces: Vec<WorkspaceId>,
     last_error: Option<String>,
-    latest_debug: Option<RuntimeDebug>,
+    pending_debug: Vec<ControlRequest>,
     pending_inputs: InputQueue,
     gesture_tracker: GestureTracker,
     last_refresh: Instant,
@@ -225,7 +225,7 @@ impl MainThreadAgent {
             next_restore_retry: None,
             active_workspaces: init.scope.initial_workspaces().to_vec(),
             last_error: hotkey_error,
-            latest_debug: None,
+            pending_debug: Vec::new(),
             pending_inputs: InputQueue::default(),
             gesture_tracker: GestureTracker::default(),
             last_refresh: initial_refresh,
@@ -295,6 +295,9 @@ impl MainThreadAgent {
                     status_item::set_automatic(false);
                     self.automatic = false;
                     self.worker.reset_disconnected();
+                    for request in self.pending_debug.drain(..) {
+                        request.respond(Err("worker stopped unexpectedly".into()));
+                    }
                     self.next_restore_retry = None;
                     self.ui_dirty = true;
                     if self.exit_intent.is_some() {
@@ -306,10 +309,9 @@ impl MainThreadAgent {
                 }
             };
             match result {
-                WorkerResult::Status { result, debug } if self.automatic => {
+                WorkerResult::Status { result } if self.automatic => {
                     self.worker.finish_command();
                     self.cancelled.store(false, Ordering::Release);
-                    self.latest_debug = Some(*debug);
                     // Newer input routinely cancels background work; only
                     // genuine failures are worth a log line.
                     if let Err(error) = &result
@@ -361,13 +363,19 @@ impl MainThreadAgent {
                     self.ui_dirty = true;
                     show_result(result, status_text.as_deref());
                 }
-                WorkerResult::Status { result, debug } => {
+                WorkerResult::Status { result } => {
                     self.worker.finish_command();
-                    self.latest_debug = Some(*debug);
                     if let Err(error) = result
                         && record_paused_worker_error(&mut self.last_error, error)
                     {
                         self.ui_dirty = true;
+                    }
+                }
+                WorkerResult::Debug(debug) => {
+                    self.worker.finish_command();
+                    let response = serde_json::to_string(&debug).map_err(|error| error.to_string());
+                    for request in self.pending_debug.drain(..) {
+                        request.respond(response.clone());
                     }
                 }
                 // Every parked window is back on screen: only now may the

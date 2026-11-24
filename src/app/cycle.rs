@@ -24,7 +24,7 @@ struct ReconcileDisplayContext<'a> {
     observation: &'a mut crate::NativeObservation,
     affinity_policy: &'a FrozenAffinityPolicy,
     server_frames: Option<&'a HashMap<u32, crate::Rect>>,
-    onscreen_frames: Option<&'a HashMap<u32, crate::Rect>>,
+    onscreen_frames: &'a mut Option<Option<HashMap<u32, crate::Rect>>>,
     cancelled: &'a AtomicBool,
     failed: &'a mut usize,
     close_recheck: &'a mut Option<Instant>,
@@ -225,7 +225,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             server_frames,
         );
         self.restore_visible(&visible, cancelled, &mut failed);
-        self.park_inactive(&outputs, &visible, server_frames, cancelled, &mut failed);
+        self.park_inactive_with_frontmost(
+            &outputs,
+            &visible,
+            frontmost.as_ref(),
+            server_frames,
+            cancelled,
+            &mut failed,
+        );
         self.recover_stranded_visible(&outputs, &visible, server_frames, cancelled, &mut failed);
         if cancelled.load(Ordering::Acquire) {
             return Err("workspace operation cancelled".into());
@@ -234,11 +241,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .backend
             .snapshot(0, &outputs)
             .map_err(|error| format!("Observation error: {error}"))?;
-        let affinity_policy =
-            self.freeze_window_affinities(&observation, &visible, server_frames)?;
-        // Taken after the Accessibility snapshot so a window listed here was
-        // on screen no earlier than the snapshot that may have omitted it.
-        let onscreen_snapshot = self.backend.onscreen_window_frames();
+        let affinity_policy = self.freeze_window_affinities(
+            &observation,
+            &visible,
+            frontmost.as_ref(),
+            server_frames,
+        )?;
+        // Taken lazily after the Accessibility snapshot only when an owned
+        // window is omitted, so a window listed here was on screen no earlier
+        // than the snapshot that omitted it.
+        let mut onscreen_snapshot: Option<Option<HashMap<u32, crate::Rect>>> = None;
         let mut close_recheck = None;
         for resolved in &visible {
             if !self.scope.manages_selector(&resolved.selector) {
@@ -251,7 +263,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                     observation: &mut observation,
                     affinity_policy: &affinity_policy,
                     server_frames: server_snapshot.as_ref(),
-                    onscreen_frames: onscreen_snapshot.as_ref(),
+                    onscreen_frames: &mut onscreen_snapshot,
                     cancelled,
                     failed: &mut failed,
                     close_recheck: &mut close_recheck,

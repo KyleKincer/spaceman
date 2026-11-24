@@ -133,7 +133,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
         if !matches!(
             command,
-            WorkerCommand::Gesture(FinalGesture::Drop { .. }, _, _)
+            WorkerCommand::Gesture(FinalGesture::Drop { .. }, _, _) | WorkerCommand::Debug(_)
         ) && let Some(session) = self.drag_session.take()
             && let WorkerCommand::Action(action, outputs) = &command
             && !matches!(action, WorkerAction::Retile)
@@ -191,6 +191,9 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 self.flush_workspace_state();
                 return Some(WorkerResult::Restored { failed });
             }
+            WorkerCommand::Debug(outputs) => {
+                return Some(WorkerResult::Debug(Box::new(self.debug_state(&outputs))));
+            }
             WorkerCommand::Stop => {
                 self.journal_event(crate::journal::JournalEvent::Stop);
                 self.flush_workspace_state();
@@ -199,10 +202,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         };
         self.sync_scratchpad(&outputs);
         self.check_arrangement(&outputs);
-        Some(WorkerResult::Status {
-            result,
-            debug: Box::new(self.debug_state(&outputs)),
-        })
+        Some(WorkerResult::Status { result })
     }
 
     fn execute_action(

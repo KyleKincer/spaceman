@@ -296,6 +296,8 @@ enum WorkerCommand {
     Gesture(FinalGesture, bool, macos::DisplayOutputs),
     /// Restore every parked window, onto these displays when they are known.
     RestoreAll(Option<macos::DisplayOutputs>),
+    /// Build a diagnostic snapshot on demand for `spaceman ctl debug`.
+    Debug(macos::DisplayOutputs),
     Stop,
 }
 
@@ -310,6 +312,7 @@ impl WorkerCommand {
             Self::Action(..) => "action",
             Self::Gesture(..) => "gesture",
             Self::RestoreAll(_) => "restore all",
+            Self::Debug(_) => "debug",
             Self::Stop => "stop",
         }
     }
@@ -363,13 +366,9 @@ impl ExitIntent {
 }
 
 enum WorkerResult {
-    Status {
-        result: Result<CycleStatus, String>,
-        debug: Box<RuntimeDebug>,
-    },
-    Restored {
-        failed: usize,
-    },
+    Status { result: Result<CycleStatus, String> },
+    Debug(Box<RuntimeDebug>),
+    Restored { failed: usize },
 }
 
 /// Startup state initialized before the Rune event loop starts: single-agent

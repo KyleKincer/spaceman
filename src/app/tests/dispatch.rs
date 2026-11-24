@@ -86,7 +86,7 @@ fn compare_dispatch(
     let mut dispatched = fixture();
     let mut expected = fixture();
     let expected_result = direct(&mut expected);
-    let Some(WorkerResult::Status { result, debug }) =
+    let Some(WorkerResult::Status { result }) =
         dispatched.execute(command, &AtomicBool::new(false))
     else {
         panic!("an action or gesture must return status, including on failure")
@@ -103,6 +103,11 @@ fn compare_dispatch(
         expected.backend.workspace_state
     );
     assert_eq!(dispatched.backend.calls, expected.backend.calls);
+    let Some(WorkerResult::Debug(debug)) =
+        dispatched.execute(WorkerCommand::Debug(outputs()), &AtomicBool::new(false))
+    else {
+        panic!("WorkerCommand::Debug must return WorkerResult::Debug")
+    };
     assert_eq!(
         serde_json::to_value(debug).unwrap(),
         serde_json::to_value(expected.debug_state(&outputs())).unwrap()

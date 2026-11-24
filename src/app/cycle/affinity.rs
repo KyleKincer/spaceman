@@ -26,8 +26,18 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         observation: &crate::NativeObservation,
         visible: &[ResolvedWorkspace],
+        frontmost: Option<&AppInstanceId>,
         server_frames: &HashMap<u32, crate::Rect>,
     ) -> Result<FrozenAffinityPolicy, String> {
+        let observed_running: HashSet<&AppInstanceId> = observation
+            .applications
+            .iter()
+            .filter_map(|app| match app {
+                crate::AppObservation::Complete { app, .. } => Some(&app.id),
+                crate::AppObservation::Unavailable { app, .. } => Some(app),
+                crate::AppObservation::Terminated { .. } => None,
+            })
+            .collect();
         let has_floating = self.workspaces.floating_entries().next().is_some();
         if has_floating {
             let floating_apps = self
@@ -36,7 +46,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 .map(|(window, _)| window.app.clone())
                 .collect::<HashSet<_>>();
             for app in floating_apps {
-                if !self.backend.is_process_running(&app) {
+                if !observed_running.contains(&app) && !self.backend.is_process_running(&app) {
                     for window in self.workspaces.floating_windows_for_app(&app) {
                         log_event!("forget floating {:?}: app exited", window);
                         self.workspaces.forget_floating(&window);
@@ -44,7 +54,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 }
             }
         }
-        self.forget_exited_apps_on_hidden_workspaces(visible);
+        self.forget_exited_apps_on_hidden_workspaces(visible, &observed_running);
 
         self.close_recalls();
         // Before any new instance below is considered: a relaunch's new
@@ -76,7 +86,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             let mut app_owns_window = self.workspaces.app_owns_windows(&app.id);
             let mut app_owns_tiled = self.workspaces.app_owns_tiled_windows(&app.id);
             for window in windows {
-                self.heal_reappeared_window(window, visible, server_frames);
+                self.heal_reappeared_window(window, visible, frontmost, server_frames);
                 if self.parked.contains_key(&window.id)
                     && self
                         .scratchpad
@@ -233,7 +243,11 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// Hidden workspaces are not reconciled, so an app that quit while its
     /// windows were parked would otherwise keep their tiles until the
     /// workspace was shown again.
-    fn forget_exited_apps_on_hidden_workspaces(&mut self, visible: &[ResolvedWorkspace]) {
+    fn forget_exited_apps_on_hidden_workspaces(
+        &mut self,
+        visible: &[ResolvedWorkspace],
+        observed_running: &HashSet<&AppInstanceId>,
+    ) {
         let mut running = HashMap::new();
         for workspace in WorkspaceId::all() {
             if visible
@@ -245,6 +259,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             let apps = self
                 .workspaces
                 .app_instances(workspace)
+                .filter(|app| !observed_running.contains(*app))
                 .cloned()
                 .collect::<HashSet<_>>();
             for app in apps {

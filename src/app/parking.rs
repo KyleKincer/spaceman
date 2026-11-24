@@ -37,6 +37,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         &mut self,
         window: &crate::ObservedWindow,
         visible: &[ResolvedWorkspace],
+        frontmost: Option<&AppInstanceId>,
         server_frames: &HashMap<u32, crate::Rect>,
     ) {
         let Some(original) = self.parked.get(&window.id).copied() else {
@@ -61,7 +62,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         else {
             return;
         };
-        if self.backend.frontmost_application().as_ref() != Some(&window.id.app) {
+        if frontmost != Some(&window.id.app) {
             // A background reappearance is an app re-asserting its saved bounds
             // (Electron does this on screen-parameter changes), not the user
             // summoning the window. Keep the recovery frame; parking pushes it
@@ -185,10 +186,31 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn park_inactive(
         &mut self,
         outputs: &macos::DisplayOutputs,
         visible: &[ResolvedWorkspace],
+        server_frames: &HashMap<u32, crate::Rect>,
+        cancelled: &AtomicBool,
+        failed: &mut usize,
+    ) {
+        let frontmost = self.backend.frontmost_application();
+        self.park_inactive_with_frontmost(
+            outputs,
+            visible,
+            frontmost.as_ref(),
+            server_frames,
+            cancelled,
+            failed,
+        );
+    }
+
+    pub(super) fn park_inactive_with_frontmost(
+        &mut self,
+        outputs: &macos::DisplayOutputs,
+        visible: &[ResolvedWorkspace],
+        frontmost: Option<&AppInstanceId>,
         server_frames: &HashMap<u32, crate::Rect>,
         cancelled: &AtomicBool,
         failed: &mut usize,
@@ -198,7 +220,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         let inactive = self.workspaces.inactive_windows_except(&visible_workspaces);
         let displays = outputs.frames().collect::<Vec<_>>();
         let screens = outputs.screens();
-        let frontmost = self.backend.frontmost_application();
+        let frontmost = frontmost.cloned();
         let context = ParkContext {
             displays: &displays,
             screens: &screens,
