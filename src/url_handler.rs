@@ -5,10 +5,7 @@
 //! before entering the action queue. Deep links only open Settings and highlight
 //! a target; they never mutate configuration or run window-tiling commands.
 
-use std::{
-    cell::{Cell, RefCell},
-    sync::mpsc::Sender,
-};
+use std::cell::{Cell, RefCell};
 
 use objc2::{
     MainThreadMarker, ffi, msg_send,
@@ -19,14 +16,17 @@ use objc2::{
 use objc2_app_kit::NSApplication;
 use objc2_foundation::{NSArray, NSString};
 
-use crate::{app::Action, deep_link};
+use crate::{
+    app::{Action, ActionSender},
+    deep_link,
+};
 
 thread_local! {
-    static SENDER: RefCell<Option<Sender<Action>>> = const { RefCell::new(None) };
+    static SENDER: RefCell<Option<ActionSender>> = const { RefCell::new(None) };
     static HOOKED: Cell<*const AnyClass> = const { Cell::new(std::ptr::null()) };
 }
 
-pub(crate) fn install(actions: Sender<Action>) -> Result<(), String> {
+pub(crate) fn install(actions: ActionSender) -> Result<(), String> {
     let marker = MainThreadMarker::new().ok_or("URL handler requires the main thread")?;
     let app = NSApplication::sharedApplication(marker);
     // SAFETY: `delegate` returns AppKit's unretained pointer to winit's installed delegate.

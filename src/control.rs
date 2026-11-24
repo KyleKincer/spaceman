@@ -6,7 +6,10 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    sync::mpsc::{Sender, channel},
+    sync::{
+        Arc,
+        mpsc::{Sender, channel},
+    },
     thread,
     time::Duration,
 };
@@ -15,6 +18,7 @@ use crate::{
     DisplaySelector, DisplayTarget, ResizeDirection, WorkspaceId,
     app::{Action, WorkerAction},
     deep_link::{self, DeepLink},
+    macos::WakeSlot,
     scratchpad::ScratchpadCommand,
 };
 
@@ -64,12 +68,16 @@ impl Drop for Server {
     }
 }
 
-pub(crate) fn listen(requests: Sender<Request>) -> Result<Server, String> {
+pub(crate) fn listen(requests: Sender<Request>, wake: Arc<WakeSlot>) -> Result<Server, String> {
     let path = socket_path()?;
-    listen_at(path, requests)
+    listen_at(path, requests, wake)
 }
 
-fn listen_at(path: PathBuf, requests: Sender<Request>) -> Result<Server, String> {
+fn listen_at(
+    path: PathBuf,
+    requests: Sender<Request>,
+    wake: Arc<WakeSlot>,
+) -> Result<Server, String> {
     let parent = path.parent().ok_or("control socket path has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("failed to create control socket directory: {error}"))?;
@@ -102,7 +110,7 @@ fn listen_at(path: PathBuf, requests: Sender<Request>) -> Result<Server, String>
         .map_err(|error| format!("failed to secure control socket: {error}"))?;
     if let Err(error) = thread::Builder::new()
         .name("spaceman-control".into())
-        .spawn(move || serve(listener, requests))
+        .spawn(move || serve(listener, requests, wake))
     {
         drop(fs::remove_file(&path));
         return Err(format!("failed to start control server: {error}"));
@@ -140,7 +148,7 @@ pub fn send(arguments: &[String]) -> Result<String, String> {
     }
 }
 
-fn serve(listener: UnixListener, requests: Sender<Request>) {
+fn serve(listener: UnixListener, requests: Sender<Request>, wake: Arc<WakeSlot>) {
     for connection in listener.incoming() {
         let Ok(mut stream) = connection else {
             continue;
@@ -153,6 +161,7 @@ fn serve(listener: UnixListener, requests: Sender<Request>) {
             requests
                 .send(Request { command, response })
                 .map_err(|_| "Spaceman agent is stopping".to_string())?;
+            wake.wake();
             receiver
                 .recv_timeout(RESPONSE_TIMEOUT)
                 .map_err(|_| "Spaceman did not respond to the control command".to_string())?
@@ -379,10 +388,10 @@ mod tests {
     fn control_socket_lock_prevents_a_second_server_from_removing_the_first_socket() {
         let path = temporary_socket_path("lock");
         let (requests, _receiver) = channel();
-        let server = listen_at(path.clone(), requests).unwrap();
+        let server = listen_at(path.clone(), requests, Arc::new(WakeSlot::new())).unwrap();
         let (requests, _receiver) = channel();
 
-        assert!(listen_at(path.clone(), requests).is_err());
+        assert!(listen_at(path.clone(), requests, Arc::new(WakeSlot::new())).is_err());
         assert!(UnixStream::connect(&path).is_ok());
         let lock_path = path.with_extension("lock");
         assert_eq!(

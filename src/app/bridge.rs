@@ -1,8 +1,8 @@
-use std::sync::{Arc, Mutex, mpsc::Sender};
+use std::sync::{Arc, Mutex};
 
 use crate::{Axis, Rect, WorkspaceId, login_item};
 
-use super::{Action, WorkerAction};
+use super::{Action, ActionSender, WorkerAction};
 
 /// Normalized preview coordinate space for HUD split rectangles.
 pub const HUD_PREVIEW_RECT: Rect = Rect {
@@ -282,12 +282,12 @@ struct SharedState {
 /// Thread-safe bridge between the main-thread agent pump and the Rune window.
 #[derive(Clone)]
 pub struct UiBridge {
-    actions: Sender<Action>,
+    actions: ActionSender,
     shared: Arc<Mutex<SharedState>>,
 }
 
 impl UiBridge {
-    pub(super) fn new(actions: Sender<Action>) -> Self {
+    pub(super) fn new(actions: ActionSender) -> Self {
         Self {
             actions,
             shared: Arc::new(Mutex::new(SharedState::default())),
@@ -378,7 +378,10 @@ mod tests {
     #[test]
     fn deduplicates_identical_snapshots_and_wakes_late_subscriber() {
         let (sender, receiver) = channel();
-        let bridge = UiBridge::new(sender);
+        let bridge = UiBridge::new(ActionSender::new(
+            sender,
+            Arc::new(crate::macos::WakeSlot::new()),
+        ));
         let wakes = Arc::new(AtomicUsize::new(0));
 
         let initial = UiAgentSnapshot {

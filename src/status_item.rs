@@ -1,4 +1,4 @@
-use std::{cell::RefCell, sync::mpsc::Sender};
+use std::cell::RefCell;
 
 use block2::RcBlock;
 use objc2::{
@@ -13,7 +13,7 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSSt
 
 use crate::{
     WorkspaceId,
-    app::{Action, HUD_PREVIEW_RECT, UiHudLayout, WorkerAction},
+    app::{Action, ActionSender, HUD_PREVIEW_RECT, UiHudLayout, WorkerAction},
     login_item,
 };
 
@@ -28,7 +28,7 @@ pub(crate) struct WorkspaceLayout {
 }
 
 struct TargetIvars {
-    actions: Sender<Action>,
+    actions: ActionSender,
 }
 
 objc2::define_class!(
@@ -94,7 +94,7 @@ objc2::define_class!(
 );
 
 impl Target {
-    fn new(actions: Sender<Action>, marker: MainThreadMarker) -> Retained<Self> {
+    fn new(actions: ActionSender, marker: MainThreadMarker) -> Retained<Self> {
         let this = Self::alloc(marker).set_ivars(TargetIvars { actions });
         // SAFETY: `NSObject`'s `-init` takes no arguments and returns an initialized `Self`.
         unsafe { msg_send![super(this), init] }
@@ -123,7 +123,7 @@ thread_local! {
     static CONTROLLER: RefCell<Option<Controller>> = const { RefCell::new(None) };
 }
 
-pub fn install(sender: Sender<Action>) -> Result<(), String> {
+pub(crate) fn install(sender: ActionSender) -> Result<(), String> {
     let marker = MainThreadMarker::new().ok_or("status item requires the main thread")?;
     let target = Target::new(sender, marker);
     let menu = NSMenu::initWithTitle(NSMenu::alloc(marker), &NSString::from_str("Spaceman"));

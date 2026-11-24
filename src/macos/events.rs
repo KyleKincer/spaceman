@@ -32,7 +32,7 @@ use objc2_foundation::{NSNotification, NSNotificationName, NSObjectProtocol};
 use crate::AppInstanceId;
 
 use super::{
-    app_instance_with_pid,
+    WakeSlot, app_instance_with_pid,
     ax::{application_element, attribute, cf_array_items, set_ax_timeout, window_server_windows},
     is_own_application,
 };
@@ -73,6 +73,8 @@ struct EventInvalidation {
     frontmost_changed: AtomicBool,
     /// The AX thread should re-read the running applications now.
     sweep_requested: AtomicBool,
+    /// Signals the main run loop when latency-sensitive events arrive.
+    wake: Arc<WakeSlot>,
 }
 
 impl EventInvalidation {
@@ -80,6 +82,7 @@ impl EventInvalidation {
     /// screen, so the next tick observes at once.
     fn app_visibility_changed(&self) {
         self.dirty.store(true, Ordering::Release);
+        self.wake.wake();
     }
 
     fn take_dirty(&self, last_title_refresh: &Cell<Option<Instant>>, now: Instant) -> bool {
@@ -124,9 +127,15 @@ impl Waker {
 impl WindowEventMonitor {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_wake(Arc::new(WakeSlot::new()))
+    }
+
+    #[must_use]
+    pub fn with_wake(wake: Arc<WakeSlot>) -> Self {
         let invalidation = Arc::new(EventInvalidation {
             dirty: AtomicBool::new(true),
             sweep_requested: AtomicBool::new(true),
+            wake,
             ..EventInvalidation::default()
         });
         let stopped = Arc::new(AtomicBool::new(false));
@@ -235,6 +244,7 @@ fn observe_workspace(
         let activated = Arc::clone(invalidation);
         let activate = RcBlock::new(move |_: NonNull<NSNotification>| {
             activated.frontmost_changed.store(true, Ordering::Release);
+            activated.wake.wake();
         });
         let mut observers = Vec::with_capacity(6);
         // SAFETY: AppKit's notification name constants are immutable statics.
@@ -244,8 +254,10 @@ fn observe_workspace(
         ));
         // A Space slide shows both Spaces' windows at once; the worker holds
         // layout until it settles (#334, #329).
-        let space_changed = RcBlock::new(|_: NonNull<NSNotification>| {
+        let space_changed_invalidation = Arc::clone(invalidation);
+        let space_changed = RcBlock::new(move |_: NonNull<NSNotification>| {
             super::spaces::note_active_space_change();
+            space_changed_invalidation.wake.wake();
         });
         // SAFETY: Same as above.
         observers.push(observe(
@@ -320,6 +332,7 @@ fn run_event_loop(
                 let applications = running_application_instances();
                 if subscriptions.sync(applications, &mut register, release, stopped) {
                     invalidation.dirty.store(true, Ordering::Release);
+                    invalidation.wake.wake();
                 }
                 next_sweep = Instant::now() + SAFETY_SWEEP_INTERVAL;
             }
@@ -620,6 +633,7 @@ unsafe extern "C-unwind" fn window_event_callback(
             invalidation.title_changed.store(true, Ordering::Release);
         } else {
             invalidation.dirty.store(true, Ordering::Release);
+            invalidation.wake.wake();
         }
     }
     if window_created {

@@ -1,7 +1,4 @@
-use std::{
-    cell::{Cell, RefCell},
-    sync::mpsc::Sender,
-};
+use std::cell::{Cell, RefCell};
 
 use objc2::{
     MainThreadMarker, ffi, msg_send,
@@ -10,11 +7,11 @@ use objc2::{
 };
 use objc2_app_kit::{NSApplication, NSApplicationTerminateReply};
 
-use crate::app::Action;
+use crate::app::{Action, ActionSender};
 
 enum Gate {
-    Idle(Sender<Action>),
-    Pending(Sender<Action>),
+    Idle(ActionSender),
+    Pending(ActionSender),
     Allowed,
 }
 
@@ -23,7 +20,7 @@ thread_local! {
     static HOOKED: Cell<*const AnyClass> = const { Cell::new(std::ptr::null()) };
 }
 
-pub(crate) fn install(actions: Sender<Action>) -> Result<(), String> {
+pub(crate) fn install(actions: ActionSender) -> Result<(), String> {
     let marker = MainThreadMarker::new().ok_or("termination gate requires the main thread")?;
     let app = NSApplication::sharedApplication(marker);
     // SAFETY: `delegate` returns AppKit's unretained pointer to winit's installed delegate.

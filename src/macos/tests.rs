@@ -326,3 +326,477 @@ fn window_server_frame_matches_full_list_and_returns_none_for_unknown_id() {
     };
     assert_eq!(super::ax::window_server_frame(&bogus), None);
 }
+
+#[test]
+fn run_loop_waker_wakes_immediately_coalesces_bursts_and_never_loses_wakeups() {
+    use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+
+    let (waker_tx, waker_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::channel::<usize>();
+    let (drained_tx, drained_rx) = mpsc::channel::<usize>();
+    let (mid_cb_enter_tx, mid_cb_enter_rx) = mpsc::channel::<()>();
+    let (mid_cb_release_tx, mid_cb_release_rx) = mpsc::channel::<()>();
+
+    let callback_count = Arc::new(AtomicUsize::new(0));
+    let pause_next_callback = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let cb_count = Arc::clone(&callback_count);
+    let cb_pause = Arc::clone(&pause_next_callback);
+    let loop_stop = Arc::clone(&stop);
+
+    let handle = thread::spawn(move || {
+        let run_loop = CFRunLoop::current().unwrap();
+        let guard = super::RunLoopWakeGuard::install_on_current_run_loop(move || {
+            cb_count.fetch_add(1, Ordering::AcqRel);
+            if cb_pause.swap(false, Ordering::AcqRel) {
+                mid_cb_enter_tx.send(()).unwrap();
+                mid_cb_release_rx.recv().unwrap();
+            }
+            while let Ok(item) = events_rx.try_recv() {
+                drained_tx.send(item).unwrap();
+            }
+        })
+        .unwrap();
+        waker_tx.send(guard.waker()).unwrap();
+        while !loop_stop.load(Ordering::Acquire) {
+            // SAFETY: `kCFRunLoopDefaultMode` is a static Core Foundation mode constant.
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.5, true);
+        }
+        drop(guard);
+        drop(run_loop);
+    });
+
+    let waker = waker_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+    // Zero idle wakeups when nothing signals.
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(callback_count.load(Ordering::Acquire), 0);
+
+    // Burst of 50 events coalesces and wakes well below the 25 ms timer interval.
+    let started = Instant::now();
+    for i in 0..50 {
+        events_tx.send(i).unwrap();
+        waker.wake();
+    }
+    let mut seen = Vec::with_capacity(50);
+    for _ in 0..50 {
+        seen.push(drained_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+    }
+    let burst_elapsed = started.elapsed();
+    assert_eq!(seen, (0..50).collect::<Vec<_>>());
+    assert!(
+        burst_elapsed < Duration::from_millis(25),
+        "event-driven wakeup took {burst_elapsed:?}"
+    );
+    let burst_callbacks = callback_count.load(Ordering::Acquire);
+    assert!(
+        (1..=10).contains(&burst_callbacks),
+        "expected coalesced callbacks, got {burst_callbacks}"
+    );
+
+    // A wake arriving while the callback is executing must trigger a follow-up
+    // pass so events published after the callback started draining are never lost.
+    pause_next_callback.store(true, Ordering::Release);
+    events_tx.send(100).unwrap();
+    waker.wake();
+    mid_cb_enter_rx
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap();
+
+    // Release the callback and race a new event + wake immediately.
+    mid_cb_release_tx.send(()).unwrap();
+    thread::sleep(Duration::from_millis(2));
+    events_tx.send(101).unwrap();
+    waker.wake();
+
+    let first = drained_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let second = drained_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!([first, second], [100, 101]);
+
+    stop.store(true, Ordering::Release);
+    waker.wake();
+    handle.join().unwrap();
+}
+
+#[test]
+fn wake_slot_remembers_early_wake_until_bound() {
+    use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    let slot = Arc::new(super::WakeSlot::new());
+    slot.wake();
+
+    let (ran_tx, ran_rx) = mpsc::channel::<()>();
+    let stop = Arc::new(AtomicBool::new(false));
+    let loop_stop = Arc::clone(&stop);
+    let loop_slot = Arc::clone(&slot);
+
+    let handle =
+        thread::spawn(move || {
+            let guard = super::RunLoopWakeGuard::install_on_current_run_loop(move || {
+                if ran_tx.send(()).is_err() {}
+            })
+            .unwrap();
+            loop_slot.bind(guard.waker());
+            while !loop_stop.load(Ordering::Acquire) {
+                // SAFETY: `kCFRunLoopDefaultMode` is a static Core Foundation mode constant.
+                CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.5, true);
+            }
+        });
+
+    ran_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    stop.store(true, Ordering::Release);
+    slot.wake();
+    handle.join().unwrap();
+}
+
+#[test]
+fn dropping_wake_guard_from_inside_callback_and_concurrent_wakes_are_safe() {
+    use objc2_core_foundation::{CFRunLoop, kCFRunLoopDefaultMode};
+    use std::{
+        cell::RefCell,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        time::Duration,
+    };
+
+    struct DropCounter(Arc<AtomicUsize>);
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    let drops = Arc::new(AtomicUsize::new(0));
+    let drops_for_cb = Arc::clone(&drops);
+    let (waker_tx, waker_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let stop_spammers = Arc::new(AtomicBool::new(false));
+
+    let handle = thread::spawn(move || {
+        let guard_slot: Rc<RefCell<Option<super::RunLoopWakeGuard>>> = Rc::new(RefCell::new(None));
+        let guard_for_cb = Rc::clone(&guard_slot);
+        let sentinel = DropCounter(drops_for_cb);
+        let guard = super::RunLoopWakeGuard::install_on_current_run_loop(move || {
+            let _keep = &sentinel;
+            // Dropping the guard from inside its own callback calls
+            // `CFRunLoopSourceInvalidate` while `wake_perform` is still on the stack.
+            guard_for_cb.borrow_mut().take();
+            if done_tx.send(()).is_err() {}
+        })
+        .unwrap();
+        let waker = guard.waker();
+        *guard_slot.borrow_mut() = Some(guard);
+        waker_tx.send(waker).unwrap();
+        while guard_slot.borrow().is_some() {
+            // SAFETY: `kCFRunLoopDefaultMode` is a static Core Foundation mode constant.
+            CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.5, true);
+        }
+    });
+
+    let waker = waker_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let spam_stop = Arc::clone(&stop_spammers);
+    let spam_waker = Arc::clone(&waker);
+    let spammer = thread::spawn(move || {
+        while !spam_stop.load(Ordering::Acquire) {
+            spam_waker.wake();
+            thread::yield_now();
+        }
+    });
+
+    done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    handle.join().unwrap();
+    stop_spammers.store(true, Ordering::Release);
+    spammer.join().unwrap();
+    // Calling wake after the guard is gone is a safe no-op.
+    waker.wake();
+    assert_eq!(drops.load(Ordering::Acquire), 1);
+}
+
+#[test]
+#[ignore = "performance benchmark: run in --release with -- --ignored --nocapture"]
+fn perf_bench_main_loop_event_wakeup() {
+    use objc2_core_foundation::{
+        CFAbsoluteTimeGetCurrent, CFRunLoop, CFRunLoopTimer, CFRunLoopTimerContext,
+        kCFRunLoopCommonModes, kCFRunLoopDefaultMode,
+    };
+    use std::{
+        ffi::c_void,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        time::{Duration, Instant},
+    };
+
+    struct PendingStamp {
+        published: Mutex<Option<Instant>>,
+        latencies: Mutex<Vec<Duration>>,
+        done_tx: mpsc::Sender<()>,
+    }
+
+    unsafe extern "C-unwind" fn timer_cb(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+        if info.is_null() {
+            return;
+        }
+        // SAFETY: `info` points to `PendingStamp` kept alive until after `timer.invalidate()`.
+        let state = unsafe { &*info.cast::<PendingStamp>() };
+        if let Some(published) = state.published.lock().unwrap().take() {
+            state.latencies.lock().unwrap().push(published.elapsed());
+            if state.done_tx.send(()).is_err() {}
+        }
+    }
+
+    fn summarize(mut samples: Vec<Duration>) -> (f64, f64, f64) {
+        samples.sort_unstable();
+        let median = samples[samples.len() / 2].as_secs_f64() * 1000.0;
+        let mean = samples
+            .iter()
+            .map(|d| d.as_secs_f64() * 1000.0)
+            .sum::<f64>()
+            / samples.len() as f64;
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)].as_secs_f64() * 1000.0;
+        (median, mean, p95)
+    }
+
+    fn run_single_hop(use_waker: bool, events: usize) -> (f64, f64, f64) {
+        let (done_tx, done_rx) = mpsc::channel();
+        let state = Arc::new(PendingStamp {
+            published: Mutex::new(None),
+            latencies: Mutex::new(Vec::with_capacity(events)),
+            done_tx,
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        let loop_state = Arc::clone(&state);
+        let loop_stop = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let run_loop = CFRunLoop::current().unwrap();
+            let mut timer_ctx = CFRunLoopTimerContext {
+                version: 0,
+                info: Arc::as_ptr(&loop_state).cast_mut().cast::<c_void>(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            // SAFETY: `timer_ctx` is valid and `loop_state` outlives the timer.
+            let timer = unsafe {
+                CFRunLoopTimer::new(
+                    None,
+                    CFAbsoluteTimeGetCurrent() + 0.025,
+                    0.025,
+                    0,
+                    0,
+                    Some(timer_cb),
+                    &raw mut timer_ctx,
+                )
+            }
+            .unwrap();
+            // SAFETY: `kCFRunLoopCommonModes` is a static Core Foundation mode constant.
+            run_loop.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+
+            let wake_state = Arc::clone(&loop_state);
+            let guard = super::RunLoopWakeGuard::install_on_current_run_loop(move || {
+                if let Some(published) = wake_state.published.lock().unwrap().take() {
+                    wake_state
+                        .latencies
+                        .lock()
+                        .unwrap()
+                        .push(published.elapsed());
+                    if wake_state.done_tx.send(()).is_err() {}
+                }
+            })
+            .unwrap();
+            ready_tx.send(guard.waker()).unwrap();
+
+            while !loop_stop.load(Ordering::Acquire) {
+                // SAFETY: `kCFRunLoopDefaultMode` is a static Core Foundation mode constant.
+                CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.05, true);
+            }
+            drop(guard);
+            // SAFETY: `kCFRunLoopCommonModes` is a static Core Foundation mode constant.
+            run_loop.remove_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+            timer.invalidate();
+        });
+
+        let waker = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        // Prime loop and spread event arrival phases across the full 25 ms period.
+        thread::sleep(Duration::from_millis(30));
+        for i in 0..events {
+            let gap_ms = 2 + ((i * 7) % 23) as u64;
+            thread::sleep(Duration::from_millis(gap_ms));
+            *state.published.lock().unwrap() = Some(Instant::now());
+            if use_waker {
+                waker.wake();
+            }
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        stop.store(true, Ordering::Release);
+        waker.wake();
+        handle.join().unwrap();
+
+        let samples = std::mem::take(&mut *state.latencies.lock().unwrap());
+        summarize(samples)
+    }
+
+    fn run_two_hop_round_trip(use_waker: bool, events: usize) -> (f64, f64, f64) {
+        let (to_worker_tx, to_worker_rx) = mpsc::channel::<Instant>();
+        let (from_worker_tx, from_worker_rx) = mpsc::channel::<Instant>();
+        let (done_tx, done_rx) = mpsc::channel::<Duration>();
+        let pending_input = Arc::new(Mutex::new(None::<Instant>));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = mpsc::channel();
+
+        struct TwoHopState {
+            pending_input: Arc<Mutex<Option<Instant>>>,
+            to_worker: mpsc::Sender<Instant>,
+            from_worker: mpsc::Receiver<Instant>,
+            done_tx: mpsc::Sender<Duration>,
+        }
+
+        impl TwoHopState {
+            fn pump(&self) {
+                while let Ok(started) = self.from_worker.try_recv() {
+                    if self.done_tx.send(started.elapsed()).is_err() {}
+                }
+                if let Some(started) = self.pending_input.lock().unwrap().take()
+                    && self.to_worker.send(started).is_err()
+                {}
+            }
+        }
+
+        unsafe extern "C-unwind" fn two_hop_timer(_timer: *mut CFRunLoopTimer, info: *mut c_void) {
+            if info.is_null() {
+                return;
+            }
+            // SAFETY: `info` points to `TwoHopState` kept alive until after `timer.invalidate()`.
+            let state = unsafe { &*info.cast::<TwoHopState>() };
+            state.pump();
+        }
+
+        let wake_slot = Arc::new(super::WakeSlot::new());
+        let worker_wake = Arc::clone(&wake_slot);
+        let worker = thread::spawn(move || {
+            while let Ok(started) = to_worker_rx.recv() {
+                if from_worker_tx.send(started).is_err() {
+                    break;
+                }
+                if use_waker {
+                    worker_wake.wake();
+                }
+            }
+        });
+
+        let loop_input = Arc::clone(&pending_input);
+        let loop_stop = Arc::clone(&stop);
+        let loop_wake = Arc::clone(&wake_slot);
+        let handle = thread::spawn(move || {
+            let run_loop = CFRunLoop::current().unwrap();
+            let state = std::rc::Rc::new(TwoHopState {
+                pending_input: loop_input,
+                to_worker: to_worker_tx,
+                from_worker: from_worker_rx,
+                done_tx,
+            });
+            let mut timer_ctx = CFRunLoopTimerContext {
+                version: 0,
+                info: std::rc::Rc::as_ptr(&state).cast_mut().cast::<c_void>(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+            };
+            // SAFETY: `timer_ctx` is valid and `state` outlives the timer.
+            let timer = unsafe {
+                CFRunLoopTimer::new(
+                    None,
+                    CFAbsoluteTimeGetCurrent() + 0.025,
+                    0.025,
+                    0,
+                    0,
+                    Some(two_hop_timer),
+                    &raw mut timer_ctx,
+                )
+            }
+            .unwrap();
+            // SAFETY: `kCFRunLoopCommonModes` is a static Core Foundation mode constant.
+            run_loop.add_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+
+            let wake_state = std::rc::Rc::clone(&state);
+            let guard = super::RunLoopWakeGuard::install_on_current_run_loop(move || {
+                wake_state.pump();
+            })
+            .unwrap();
+            loop_wake.bind(guard.waker());
+            ready_tx.send(guard.waker()).unwrap();
+
+            while !loop_stop.load(Ordering::Acquire) {
+                // SAFETY: `kCFRunLoopDefaultMode` is a static Core Foundation mode constant.
+                CFRunLoop::run_in_mode(unsafe { kCFRunLoopDefaultMode }, 0.05, true);
+            }
+            drop(guard);
+            // SAFETY: `kCFRunLoopCommonModes` is a static Core Foundation mode constant.
+            run_loop.remove_timer(Some(&timer), unsafe { kCFRunLoopCommonModes });
+            timer.invalidate();
+        });
+
+        let waker = ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let mut samples = Vec::with_capacity(events);
+        for i in 0..events {
+            let gap_ms = 2 + ((i * 7) % 23) as u64;
+            thread::sleep(Duration::from_millis(gap_ms));
+            *pending_input.lock().unwrap() = Some(Instant::now());
+            if use_waker {
+                wake_slot.wake();
+            }
+            samples.push(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        }
+        stop.store(true, Ordering::Release);
+        waker.wake();
+        handle.join().unwrap();
+        worker.join().unwrap();
+        summarize(samples)
+    }
+
+    let (base_1_med, base_1_mean, base_1_p95) = run_single_hop(false, 40);
+    let (opt_1_med, opt_1_mean, opt_1_p95) = run_single_hop(true, 40);
+    let (base_2_med, base_2_mean, base_2_p95) = run_two_hop_round_trip(false, 25);
+    let (opt_2_med, opt_2_mean, opt_2_p95) = run_two_hop_round_trip(true, 25);
+
+    println!(
+        "perf_bench_main_loop_wakeup_1hop_timer_only: median={base_1_med:.3}ms mean={base_1_mean:.3}ms p95={base_1_p95:.3}ms"
+    );
+    println!(
+        "perf_bench_main_loop_wakeup_1hop_event_driven: median={opt_1_med:.3}ms mean={opt_1_mean:.3}ms p95={opt_1_p95:.3}ms (speedup={:.1}x)",
+        base_1_med / opt_1_med.max(0.0001)
+    );
+    println!(
+        "perf_bench_main_loop_wakeup_2hop_timer_only: median={base_2_med:.3}ms mean={base_2_mean:.3}ms p95={base_2_p95:.3}ms"
+    );
+    println!(
+        "perf_bench_main_loop_wakeup_2hop_event_driven: median={opt_2_med:.3}ms mean={opt_2_mean:.3}ms p95={opt_2_p95:.3}ms (speedup={:.1}x)",
+        base_2_med / opt_2_med.max(0.0001)
+    );
+}

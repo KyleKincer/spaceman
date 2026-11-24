@@ -30,6 +30,7 @@ struct PumpState {
     agent: MainThreadAgent,
     window: rune::AppHandle<Ui>,
     timer: Retained<NSTimer>,
+    _wake_guard: Option<spaceman::macos::RunLoopWakeGuard>,
 }
 
 thread_local! {
@@ -187,6 +188,10 @@ fn start_main_thread() {
             return;
         }
     };
+    let wake_guard = spaceman::macos::RunLoopWakeGuard::install_on_current_run_loop(tick_pump);
+    if let Some(guard) = &wake_guard {
+        agent.set_waker(guard.waker());
+    }
     let block = RcBlock::new(|_: NonNull<NSTimer>| {
         autoreleasepool(|_| tick_pump());
     });
@@ -208,18 +213,21 @@ fn start_main_thread() {
             agent,
             window,
             timer,
+            _wake_guard: wake_guard,
         });
     });
 }
 
 fn tick_pump() {
     let recording = RECORDING_SHORTCUT.with(Cell::get);
-    let saved = SAVED_SHORTCUTS.with(|slot| slot.borrow_mut().take());
     let outcome = PUMP.with(|slot| {
-        slot.borrow_mut().as_mut().map(|state| {
+        let Ok(mut guard) = slot.try_borrow_mut() else {
+            return None;
+        };
+        guard.as_mut().map(|state| {
             // A table saved by the recorder registers before the recording's hold ends, so
             // the hotkeys come back once, with the new chord.
-            if let Some(shortcuts) = saved {
+            if let Some(shortcuts) = SAVED_SHORTCUTS.with(|saved| saved.borrow_mut().take()) {
                 state.agent.apply_shortcuts(shortcuts);
             }
             state.agent.set_shortcut_recording(recording);

@@ -1,14 +1,27 @@
 use super::*;
 
-pub(super) fn spawn_worker(
-    commands: Receiver<WorkerCommand>,
-    results: Sender<WorkerResult>,
-    cancelled: Arc<AtomicBool>,
-    scope: ManagementScope,
-    parked: HashMap<crate::PhysicalWindowId, crate::Rect>,
-    config: Config,
-    workspace_state: Option<crate::workspace::WorkspaceState>,
-) {
+pub(super) struct WorkerInit {
+    pub(super) commands: Receiver<WorkerCommand>,
+    pub(super) results: Sender<WorkerResult>,
+    pub(super) cancelled: Arc<AtomicBool>,
+    pub(super) wake: Arc<macos::WakeSlot>,
+    pub(super) scope: ManagementScope,
+    pub(super) parked: HashMap<crate::PhysicalWindowId, crate::Rect>,
+    pub(super) config: Config,
+    pub(super) workspace_state: Option<crate::workspace::WorkspaceState>,
+}
+
+pub(super) fn spawn_worker(init: WorkerInit) {
+    let WorkerInit {
+        commands,
+        results,
+        cancelled,
+        wake,
+        scope,
+        parked,
+        config,
+        workspace_state,
+    } = init;
     thread::spawn(move || {
         let mut config_stamp = crate::config::modified();
         let restore_on_start = workspace_state.is_none();
@@ -60,6 +73,7 @@ pub(super) fn spawn_worker(
             if results.send(result).is_err() {
                 return;
             }
+            wake.wake();
         }
     });
 }

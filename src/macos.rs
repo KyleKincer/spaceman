@@ -10,6 +10,7 @@ mod spaces;
 mod swipes;
 #[cfg(test)]
 mod tests;
+mod wake;
 mod window_attributes;
 
 use std::collections::{HashMap, HashSet};
@@ -47,6 +48,7 @@ pub use presenter::{
 };
 pub use spaces::{last_active_space_change, take_active_space_changed};
 pub use swipes::SwipeMonitor;
+pub use wake::{RunLoopWakeGuard, RunLoopWaker, WakeSlot};
 
 use apply::{cache_managed_window, evict_managed_app, prune_managed_app};
 use ax::{

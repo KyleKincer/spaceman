@@ -77,7 +77,7 @@ impl MainThreadAgent {
 
     fn queue_action(&self, action: Action, ack: &str) -> Result<String, String> {
         self.actions_sender
-            .send(action)
+            .send_quiet(action)
             .map(|()| ack.into())
             .map_err(|_| "Spaceman agent is stopping".into())
     }

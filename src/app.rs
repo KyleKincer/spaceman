@@ -81,7 +81,7 @@ use input::{GestureTracker, InputQueue, QueuedInput};
 use journal::JournalState;
 use memory::MemoryState;
 use runtime::*;
-use worker::spawn_worker;
+use worker::{WorkerInit, spawn_worker};
 
 pub const TICK_INTERVAL: Duration = Duration::from_millis(25);
 /// Prefix on `UiAgentSnapshot::last_error` when installing a staged update fails.
@@ -371,14 +371,42 @@ enum WorkerResult {
     Restored { failed: usize },
 }
 
+#[derive(Clone)]
+pub(crate) struct ActionSender {
+    sender: Sender<Action>,
+    wake: Arc<macos::WakeSlot>,
+}
+
+impl ActionSender {
+    pub(crate) fn new(sender: Sender<Action>, wake: Arc<macos::WakeSlot>) -> Self {
+        Self { sender, wake }
+    }
+
+    pub(crate) fn send(&self, action: Action) -> Result<(), std::sync::mpsc::SendError<Action>> {
+        self.sender.send(action)?;
+        self.wake.wake();
+        Ok(())
+    }
+
+    /// Sends on the channel without waking the run loop; used inside `tick()` when
+    /// `drain_actions()` is about to run in the same pass.
+    pub(crate) fn send_quiet(
+        &self,
+        action: Action,
+    ) -> Result<(), std::sync::mpsc::SendError<Action>> {
+        self.sender.send(action)
+    }
+}
+
 /// Startup state initialized before the Rune event loop starts: single-agent
 /// lock, control socket, signal handler, and the window-management worker.
 pub struct PreparedAgent {
     actions: Receiver<Action>,
-    actions_sender: Sender<Action>,
+    actions_sender: ActionSender,
     commands: Sender<WorkerCommand>,
     results: Receiver<WorkerResult>,
     cancelled: Arc<AtomicBool>,
+    wake: Arc<macos::WakeSlot>,
     scope: ManagementScope,
     hotkey_workspaces: Vec<WorkspaceId>,
     shortcuts: crate::shortcuts::Shortcuts,
@@ -416,11 +444,13 @@ pub fn prepare() -> Result<(PreparedAgent, UiBridge), String> {
         .into_iter()
         .collect::<Vec<_>>();
     hotkey_workspaces.sort();
+    let wake = Arc::new(macos::WakeSlot::new());
     let (commands, worker_commands) = channel();
     let (worker_results, results) = channel();
-    let (actions_sender, actions) = channel();
+    let (raw_actions_sender, actions) = channel();
+    let actions_sender = ActionSender::new(raw_actions_sender, Arc::clone(&wake));
     let (control_requests, controls) = channel();
-    let control_server = control::listen(control_requests)?;
+    let control_server = control::listen(control_requests, Arc::clone(&wake))?;
     let signal_actions = actions_sender.clone();
     ctrlc::set_handler(move || {
         // Receiver disconnection means the main loop has already exited.
@@ -428,15 +458,16 @@ pub fn prepare() -> Result<(PreparedAgent, UiBridge), String> {
     })
     .map_err(|error| format!("failed to install app signal handler: {error}"))?;
     let cancelled = Arc::new(AtomicBool::new(false));
-    spawn_worker(
-        worker_commands,
-        worker_results,
-        Arc::clone(&cancelled),
+    spawn_worker(WorkerInit {
+        commands: worker_commands,
+        results: worker_results,
+        cancelled: Arc::clone(&cancelled),
+        wake: Arc::clone(&wake),
         scope,
         parked,
         config,
         workspace_state,
-    );
+    });
     let bridge = UiBridge::new(actions_sender.clone());
     Ok((
         PreparedAgent {
@@ -445,6 +476,7 @@ pub fn prepare() -> Result<(PreparedAgent, UiBridge), String> {
             commands,
             results,
             cancelled,
+            wake,
             scope,
             hotkey_workspaces,
             shortcuts,
@@ -498,7 +530,7 @@ impl PreparedAgent {
         status_item::set_workspace_numbers(&workspace_numbers);
         let trusted = macos::accessibility_trusted();
         status_item::set_accessibility(trusted);
-        let events = macos::WindowEventMonitor::new();
+        let events = macos::WindowEventMonitor::with_wake(Arc::clone(&self.wake));
         let mut agent = MainThreadAgent::new(
             AppLoopInit {
                 actions: self.actions,
@@ -506,6 +538,7 @@ impl PreparedAgent {
                 commands: self.commands,
                 results: self.results,
                 cancelled: self.cancelled,
+                wake: self.wake,
                 scope: self.scope,
                 events,
                 hotkey_workspaces: self.hotkey_workspaces,

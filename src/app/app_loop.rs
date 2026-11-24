@@ -70,10 +70,11 @@ pub enum TickOutcome {
 
 pub(super) struct AppLoopInit {
     pub(super) actions: Receiver<Action>,
-    pub(super) actions_sender: Sender<Action>,
+    pub(super) actions_sender: ActionSender,
     pub(super) commands: Sender<WorkerCommand>,
     pub(super) results: Receiver<WorkerResult>,
     pub(super) cancelled: Arc<AtomicBool>,
+    pub(super) wake: Arc<macos::WakeSlot>,
     pub(super) scope: ManagementScope,
     pub(super) events: macos::WindowEventMonitor,
     pub(super) hotkey_workspaces: Vec<WorkspaceId>,
@@ -91,10 +92,11 @@ pub(super) struct AppLoopInit {
 
 pub struct MainThreadAgent {
     actions: Receiver<Action>,
-    actions_sender: Sender<Action>,
+    actions_sender: ActionSender,
     worker: WorkerDispatch,
     results: Receiver<WorkerResult>,
     cancelled: Arc<AtomicBool>,
+    wake: Arc<macos::WakeSlot>,
     scope: ManagementScope,
     events: macos::WindowEventMonitor,
     hotkey_workspaces: Vec<WorkspaceId>,
@@ -200,6 +202,7 @@ impl MainThreadAgent {
             worker,
             results: init.results,
             cancelled: init.cancelled,
+            wake: init.wake,
             scope: init.scope,
             events: init.events,
             hotkey_workspaces: init.hotkey_workspaces,
@@ -259,6 +262,13 @@ impl MainThreadAgent {
 
     pub(super) fn set_callbacks(&mut self, callbacks: HostCallbacks) {
         self.callbacks = callbacks;
+    }
+
+    /// Binds the host's main-thread `CFRunLoop` waker so AX events, worker
+    /// completions, control requests, hotkeys, swipes, and UI actions wake the
+    /// pump immediately instead of waiting for the 25 ms fallback timer.
+    pub fn set_waker(&self, waker: Arc<macos::RunLoopWaker>) {
+        self.wake.bind(waker);
     }
 
     fn listen_for_input(&mut self) {

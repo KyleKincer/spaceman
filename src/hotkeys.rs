@@ -4,14 +4,13 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::c_void,
     ptr,
-    sync::mpsc::Sender,
 };
 
 pub(crate) use delivery::DeliveryWatch;
 
 use crate::{
     Direction, DisplayTarget, ResizeDirection, WorkspaceId,
-    app::{Action, WorkerAction},
+    app::{Action, ActionSender, WorkerAction},
     keyboard_layout::{LayoutFingerprint, LayoutSnapshot, LogicalKey, SemanticKey},
     scratchpad::ScratchpadCommand,
     shortcuts::{self, Binding, Command, Shortcuts},
@@ -84,7 +83,7 @@ pub struct Hotkeys {
 
 /// Read by the Carbon handler.
 struct HandlerContext {
-    sender: Sender<Action>,
+    sender: ActionSender,
 }
 
 #[derive(Debug)]
@@ -455,7 +454,7 @@ impl<'a> PlanBuilder<'a> {
 }
 
 impl Hotkeys {
-    pub fn install(sender: Sender<Action>, plan: HotkeyPlan) -> Result<Self, String> {
+    pub(crate) fn install(sender: ActionSender, plan: HotkeyPlan) -> Result<Self, String> {
         let context = Box::new(HandlerContext { sender });
         let context_pointer = (&raw const *context).cast_mut();
         let event_type = EventTypeSpec {
