@@ -8,6 +8,7 @@ pub(super) use readback::{APPLY_ATTEMPT_LIMIT, AppliedFrame, record_apply_attemp
 
 use affinity::{FrozenAffinityPolicy, FrozenWindowAffinity};
 
+use super::parking::RESTORE_CONFIRM_TOLERANCE;
 use super::*;
 use crate::journal::PlacementSource;
 
@@ -43,13 +44,16 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .iter()
             .flat_map(|resolved| self.workspaces.windows(resolved.workspace))
             .collect();
+        let mut removed = Vec::new();
+        let mut pending = Vec::new();
         for window in windows {
             if cancelled.load(Ordering::Acquire) {
+                self.persist_removals_or_rollback(removed);
                 return;
             }
-            if !self.parked.contains_key(&window) {
+            let Some(frame) = self.parked.get(&window).copied() else {
                 continue;
-            }
+            };
             let retry_throttled = self
                 .recently_parked
                 .get(&window)
@@ -68,13 +72,36 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             if retry_throttled {
                 continue;
             }
-            if !matches!(
-                self.restore_window(&window),
-                macos::ApplyOutcome::Applied | macos::ApplyOutcome::Gone
-            ) {
-                *failed += 1;
+            match self.write_restore_position(&window, frame) {
+                macos::ApplyOutcome::Applied => pending.push((window, frame)),
+                macos::ApplyOutcome::Gone => removed.push((window, frame)),
+                _ => *failed += 1,
             }
         }
+        if !pending.is_empty() {
+            let pending_ids: Vec<_> = pending.iter().map(|(w, _)| w.clone()).collect();
+            let server_frames = self.reveal_frames(&pending_ids);
+            for (window, frame) in pending {
+                let target = self.restore_target(frame);
+                let actual = match &server_frames {
+                    Some(frames) => frames.get(&window.window_id).copied(),
+                    None => self.backend.window_server_frame(&window),
+                };
+                if actual.is_some_and(|actual| {
+                    actual.position_approximately_equals(target, RESTORE_CONFIRM_TOLERANCE)
+                }) {
+                    self.commit_unparked(&window);
+                    removed.push((window, frame));
+                } else {
+                    log_event!(
+                        "restore pending: {:?} not yet at {:?} per the window server",
+                        window,
+                        frame
+                    );
+                }
+            }
+        }
+        self.persist_removals_or_rollback(removed);
     }
 
     pub(super) fn cycle(

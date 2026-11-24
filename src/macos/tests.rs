@@ -299,3 +299,30 @@ fn missing_window_id_skips_non_standard_elements_like_finders_desktop() {
     assert!(!should_ignore_missing_window_id(Some("AXWindow"), None));
     assert!(!should_ignore_missing_window_id(None, None));
 }
+
+#[test]
+fn window_server_frame_matches_full_list_and_returns_none_for_unknown_id() {
+    let Some(windows) =
+        super::ax::window_server_windows(objc2_core_graphics::CGWindowListOption::OptionAll)
+    else {
+        return;
+    };
+    for window in windows.iter().take(16) {
+        let id = PhysicalWindowId {
+            app: AppInstanceId {
+                pid: window.pid,
+                launched_at: 1,
+            },
+            window_id: window.id,
+        };
+        assert_eq!(super::ax::window_server_frame(&id), Some(window.frame));
+    }
+    let bogus = PhysicalWindowId {
+        app: AppInstanceId {
+            pid: 1,
+            launched_at: 1,
+        },
+        window_id: u32::MAX,
+    };
+    assert_eq!(super::ax::window_server_frame(&bogus), None);
+}

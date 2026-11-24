@@ -969,3 +969,99 @@ fn reveal_confirms_a_window_missing_from_the_onscreen_list_from_the_full_list() 
     assert!(runtime.wait_for_reveal(std::slice::from_ref(&incoming), &AtomicBool::new(false)));
     assert!(!runtime.parked.contains_key(&incoming));
 }
+
+#[test]
+fn switch_batches_persistence_across_multiple_incoming_and_outgoing_windows() {
+    let out = outputs();
+    let displays: Vec<_> = out.frames().collect();
+    let outgoing: Vec<_> = (10..14).map(window).collect();
+    let incoming: Vec<_> = (20..24).map(window).collect();
+    let mut backend = FakeBackend::default();
+    let mut parked = HashMap::new();
+    for (i, w) in outgoing.iter().enumerate() {
+        backend.frames.insert(w.clone(), frame(50 + i as i32 * 20));
+    }
+    for (i, w) in incoming.iter().enumerate() {
+        let normal = frame(100 + i as i32 * 20);
+        backend.frames.insert(
+            w.clone(),
+            crate::geometry::parked_frame(out.main().frame, &displays, normal),
+        );
+        parked.insert(w.clone(), normal);
+    }
+    let mut rt = WorkspaceRuntime::with_backend(ManagementScope::Both, backend, parked);
+    for w in &outgoing {
+        bind(&mut rt, WorkspaceId::ONE, w);
+    }
+    let target = WorkspaceId::new(2).unwrap();
+    for w in &incoming {
+        bind(&mut rt, target, w);
+    }
+
+    rt.switch(target, out, &AtomicBool::new(false)).unwrap();
+
+    let persist_calls = rt
+        .backend
+        .calls
+        .iter()
+        .filter(|call| matches!(call, BackendCall::Persist))
+        .count();
+    // 1 batched reveal-removal persist + 1 batched outgoing-recovery persist
+    assert_eq!(persist_calls, 2);
+    for w in &outgoing {
+        assert!(rt.parked.contains_key(w));
+    }
+    for w in &incoming {
+        assert!(!rt.parked.contains_key(w));
+    }
+}
+
+#[test]
+fn switch_rolls_back_unmoved_outgoing_windows_on_mid_batch_park_failure() {
+    let out = outputs();
+    let displays: Vec<_> = out.frames().collect();
+    let out0 = window(10);
+    let out1 = window(11);
+    let out2 = window(12);
+    let inc0 = window(20);
+    let inc_normal = frame(100);
+    let mut backend = FakeBackend::default();
+    backend.frames.insert(out0.clone(), frame(50));
+    backend.frames.insert(
+        out1.clone(),
+        crate::Rect {
+            width: 444,
+            ..frame(70)
+        },
+    );
+    backend.frames.insert(out2.clone(), frame(90));
+    backend.frames.insert(
+        inc0.clone(),
+        crate::geometry::parked_frame(out.main().frame, &displays, inc_normal),
+    );
+    backend.refuses_position = Some(|target| target.width == 444 && target.x != 70);
+    let mut rt = WorkspaceRuntime::with_backend(
+        ManagementScope::Both,
+        backend,
+        HashMap::from([(inc0.clone(), inc_normal)]),
+    );
+    bind(&mut rt, WorkspaceId::ONE, &out0);
+    bind(&mut rt, WorkspaceId::ONE, &out1);
+    bind(&mut rt, WorkspaceId::ONE, &out2);
+    let target = WorkspaceId::new(2).unwrap();
+    bind(&mut rt, target, &inc0);
+
+    assert!(rt.switch(target, out, &AtomicBool::new(false)).is_err());
+
+    assert_eq!(
+        rt.workspaces.active_for(&DisplaySelector::Main),
+        Some(WorkspaceId::ONE)
+    );
+    // All outgoing windows remain unparked and at their frames; incoming re-parked.
+    assert!(!rt.parked.contains_key(&out0));
+    assert!(!rt.parked.contains_key(&out1));
+    assert!(!rt.parked.contains_key(&out2));
+    assert!(rt.parked.contains_key(&inc0));
+    assert_eq!(rt.backend.persisted.len(), 1);
+    assert!(rt.backend.persisted.contains_key(&inc0));
+}

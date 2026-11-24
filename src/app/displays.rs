@@ -103,6 +103,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             .previous
             .as_ref()
             .map(|previous| (previous.frames().collect::<Vec<_>>(), previous.screens()));
+        let server_frames = self.backend.window_server_frames();
         for window in std::mem::take(&mut self.displays.repark_pending) {
             if !self.parked.contains_key(&window) || self.parking_exempt.contains(&window) {
                 continue;
@@ -123,7 +124,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             } else {
                 continue;
             };
-            if !self.repark_for_displays(&window, output, &displays, &screens, previous.as_ref()) {
+            if !self.repark_for_displays(
+                &window,
+                output,
+                &displays,
+                &screens,
+                previous.as_ref(),
+                server_frames.as_ref(),
+            ) {
                 self.displays.repark_pending.insert(window);
             }
         }
@@ -137,8 +145,13 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         displays: &[crate::Rect],
         screens: &[crate::Rect],
         previous: Option<&(Vec<crate::Rect>, Vec<crate::Rect>)>,
+        server_frames: Option<&HashMap<u32, crate::Rect>>,
     ) -> bool {
-        let Some(current) = self.backend.window_server_frame(window) else {
+        let current = match server_frames {
+            Some(frames) => frames.get(&window.window_id).copied(),
+            None => self.backend.window_server_frame(window),
+        };
+        let Some(current) = current else {
             return false;
         };
         let target = crate::geometry::parked_frame_clear_of(output, displays, screens, current);

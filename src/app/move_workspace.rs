@@ -115,8 +115,10 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         // Phase 1: reveal and lay out the source display's replacement workspace
         // beneath moved_ws before moving anything off the source display.
         let mut restored_source = Vec::new();
+        let mut gone_source_removals = Vec::new();
         for window in &source_incoming {
             if cancelled.load(Ordering::Acquire) {
+                self.persist_removals_or_rollback(gone_source_removals);
                 self.rollback_move_workspace(MoveRollback {
                     moved_ws,
                     moved_relocated: false,
@@ -129,13 +131,14 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 });
                 return Err("workspace move cancelled".into());
             }
-            if !self.parked.contains_key(window) {
+            let Some(frame) = self.parked.get(window).copied() else {
                 continue;
-            }
+            };
             restored_source.push(window.clone());
-            match self.restore_window(window) {
+            match self.write_restore_position(window, frame) {
                 macos::ApplyOutcome::Applied => {}
                 macos::ApplyOutcome::Gone => {
+                    gone_source_removals.push((window.clone(), frame));
                     if let Some(replacement) = source_replacement {
                         self.forget_window(replacement, window);
                     }
@@ -146,6 +149,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         window,
                         outcome
                     );
+                    self.persist_removals_or_rollback(gone_source_removals);
                     self.rollback_move_workspace(MoveRollback {
                         moved_ws,
                         moved_relocated: false,
@@ -162,6 +166,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 }
             }
         }
+        self.persist_removals_or_rollback(gone_source_removals);
         if !self.wait_for_reveal(&source_incoming, cancelled) {
             self.rollback_move_workspace(MoveRollback {
                 moved_ws,
@@ -298,9 +303,15 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         }
 
         // Phase 3: park the displaced workspace's windows on the target display.
-        let mut parked_displaced = Vec::new();
-        for window in &displaced_outgoing {
-            if cancelled.load(Ordering::Acquire) {
+        let parked_displaced = match self.park_windows_batch(
+            displaced,
+            &displaced_outgoing,
+            target_output,
+            &outputs,
+            cancelled,
+        ) {
+            Ok(parked) => parked,
+            Err(super::switching::ParkBatchError::Cancelled(parked_displaced)) => {
                 self.rollback_move_workspace(MoveRollback {
                     moved_ws,
                     moved_relocated: true,
@@ -313,35 +324,31 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 });
                 return Err("workspace move cancelled".into());
             }
-            match self.park_window(window, target_output, &outputs) {
-                macos::ApplyOutcome::Applied => parked_displaced.push(window.clone()),
-                macos::ApplyOutcome::Gone => {
-                    if let Some(displaced_ws) = displaced {
-                        self.forget_window(displaced_ws, window);
-                    }
-                }
-                outcome => {
-                    log_event!(
-                        "move-workspace rollback: could not park {:?} ({:?})",
-                        window,
-                        outcome
-                    );
-                    self.rollback_move_workspace(MoveRollback {
-                        moved_ws,
-                        moved_relocated: true,
-                        moved_floating_originals: &moved_floating_originals,
-                        parked_displaced,
-                        revealed_source: &source_incoming,
-                        source_incoming_originals: &source_incoming_originals,
-                        source_output,
-                        outputs: &outputs,
-                    });
-                    return Err(format!(
-                        "Workspace {moved_ws} stayed on {source_display_name} because a window could not be parked"
-                    ));
-                }
+            Err(super::switching::ParkBatchError::Failed {
+                window,
+                outcome,
+                parked: parked_displaced,
+            }) => {
+                log_event!(
+                    "move-workspace rollback: could not park {:?} ({:?})",
+                    window,
+                    outcome
+                );
+                self.rollback_move_workspace(MoveRollback {
+                    moved_ws,
+                    moved_relocated: true,
+                    moved_floating_originals: &moved_floating_originals,
+                    parked_displaced,
+                    revealed_source: &source_incoming,
+                    source_incoming_originals: &source_incoming_originals,
+                    source_output,
+                    outputs: &outputs,
+                });
+                return Err(format!(
+                    "Workspace {moved_ws} stayed on {source_display_name} because a window could not be parked"
+                ));
             }
-        }
+        };
 
         // Phase 4: persist the assignment in config.toml before committing
         // in-memory state so a config save failure rolls back cleanly.

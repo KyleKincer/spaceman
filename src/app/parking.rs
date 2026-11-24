@@ -491,17 +491,41 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     }
 
     pub(super) fn restore_windows(&mut self, windows: Vec<crate::PhysicalWindowId>) -> usize {
-        let mut restored = Vec::new();
+        let mut removed = Vec::new();
+        let mut pending = Vec::new();
         for window in &windows {
             let Some(frame) = self.parked.get(window).copied() else {
                 continue;
             };
-            self.restore_window_uncommitted(window);
-            if !self.parked.contains_key(window) {
-                restored.push((window.clone(), frame));
+            match self.write_restore_position(window, frame) {
+                macos::ApplyOutcome::Applied => pending.push((window.clone(), frame)),
+                macos::ApplyOutcome::Gone => removed.push((window.clone(), frame)),
+                _ => {}
             }
         }
-        self.persist_removals_or_rollback(restored);
+        if !pending.is_empty() {
+            let server_frames = self.backend.window_server_frames();
+            for (window, frame) in pending {
+                let target = self.restore_target(frame);
+                let actual = match &server_frames {
+                    Some(frames) => frames.get(&window.window_id).copied(),
+                    None => self.backend.window_server_frame(&window),
+                };
+                if actual.is_some_and(|actual| {
+                    actual.position_approximately_equals(target, RESTORE_CONFIRM_TOLERANCE)
+                }) {
+                    self.commit_unparked(&window);
+                    removed.push((window, frame));
+                } else {
+                    log_event!(
+                        "restore pending: {:?} not yet at {:?} per the window server",
+                        window,
+                        frame
+                    );
+                }
+            }
+        }
+        self.persist_removals_or_rollback(removed);
         // Persistence failure rolls recovery entries back into this map. The
         // caller may only exit when both native restoration and durable state
         // removal have completed.
@@ -708,7 +732,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
         outcome
     }
 
-    fn restore_window_uncommitted(
+    pub(super) fn restore_window_uncommitted(
         &mut self,
         window: &crate::PhysicalWindowId,
     ) -> macos::ApplyOutcome {

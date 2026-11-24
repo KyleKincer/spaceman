@@ -16,6 +16,15 @@ mod repeat;
 
 pub(super) use repeat::RepeatSwitch;
 
+pub(super) enum ParkBatchError {
+    Cancelled(Vec<crate::PhysicalWindowId>),
+    Failed {
+        window: crate::PhysicalWindowId,
+        outcome: macos::ApplyOutcome,
+        parked: Vec<crate::PhysicalWindowId>,
+    },
+}
+
 impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     pub(super) fn switch(
         &mut self,
@@ -142,19 +151,22 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             })
             .collect();
         let mut restored = Vec::new();
+        let mut gone_removals = Vec::new();
         for window in &incoming {
             if cancelled.load(Ordering::Acquire) {
                 log_event!("switch cancelled while revealing incoming windows");
+                self.persist_removals_or_rollback(gone_removals);
                 self.rollback_switch(Vec::new(), &restored, &incoming_originals, output, &outputs);
                 return Err("workspace switch cancelled".into());
             }
-            if !self.parked.contains_key(window) {
+            let Some(frame) = self.parked.get(window).copied() else {
                 continue;
-            }
+            };
             restored.push(window.clone());
-            match self.restore_window(window) {
+            match self.write_restore_position(window, frame) {
                 macos::ApplyOutcome::Applied => {}
                 macos::ApplyOutcome::Gone => {
+                    gone_removals.push((window.clone(), frame));
                     self.forget_window(workspace, window);
                 }
                 outcome => {
@@ -163,6 +175,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         window,
                         outcome
                     );
+                    self.persist_removals_or_rollback(gone_removals);
                     self.rollback_switch(
                         Vec::new(),
                         &restored,
@@ -177,6 +190,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 }
             }
         }
+        self.persist_removals_or_rollback(gone_removals);
         if !self.wait_for_reveal(&incoming, cancelled) {
             self.rollback_switch(Vec::new(), &restored, &incoming_originals, output, &outputs);
             if cancelled.load(Ordering::Acquire) {
@@ -200,25 +214,25 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                 workspace
             ));
         }
-        let mut parked_outgoing = Vec::new();
-        for window in &outgoing {
-            if cancelled.load(Ordering::Acquire) {
-                log_event!("switch cancelled while parking outgoing windows");
-                self.rollback_switch(
-                    parked_outgoing,
-                    &incoming,
-                    &incoming_originals,
-                    output,
-                    &outputs,
-                );
-                return Err("workspace switch cancelled".into());
-            }
-            match self.park_window(window, output, &outputs) {
-                macos::ApplyOutcome::Applied => parked_outgoing.push(window.clone()),
-                macos::ApplyOutcome::Gone => {
-                    self.forget_window(previous, window);
+        let parked_outgoing =
+            match self.park_windows_batch(Some(previous), &outgoing, output, &outputs, cancelled) {
+                Ok(parked) => parked,
+                Err(ParkBatchError::Cancelled(parked_outgoing)) => {
+                    log_event!("switch cancelled while parking outgoing windows");
+                    self.rollback_switch(
+                        parked_outgoing,
+                        &incoming,
+                        &incoming_originals,
+                        output,
+                        &outputs,
+                    );
+                    return Err("workspace switch cancelled".into());
                 }
-                outcome => {
+                Err(ParkBatchError::Failed {
+                    window,
+                    outcome,
+                    parked: parked_outgoing,
+                }) => {
                     log_event!(
                         "switch rollback: could not park {:?} ({:?})",
                         window,
@@ -236,8 +250,8 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
                         previous
                     ));
                 }
-            }
-        }
+            };
+        let _ = parked_outgoing;
         let focus_already_in_workspace = reported_focused_before
             .as_ref()
             .is_some_and(|window| self.workspaces.workspace_of_any(window) == Some(workspace))
@@ -438,7 +452,7 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
     /// full one) settles every window it contains; the full list is read only
     /// when a pending window is missing from it (another Space, ordered out),
     /// so such windows confirm exactly as before.
-    fn reveal_frames(
+    pub(super) fn reveal_frames(
         &mut self,
         pending: &[crate::PhysicalWindowId],
     ) -> Option<HashMap<u32, crate::Rect>> {
@@ -450,6 +464,149 @@ impl<B: WorkspaceBackend> WorkspaceRuntime<B> {
             return Some(frames);
         }
         self.backend.window_server_frames()
+    }
+
+    /// Park a batch of outgoing windows using one shared window-server snapshot
+    /// and one atomic `persist_parked` write before any window moves off-screen.
+    pub(super) fn park_windows_batch(
+        &mut self,
+        workspace: Option<WorkspaceId>,
+        outgoing: &[crate::PhysicalWindowId],
+        output: crate::Rect,
+        outputs: &macos::DisplayOutputs,
+        cancelled: &AtomicBool,
+    ) -> Result<Vec<crate::PhysicalWindowId>, ParkBatchError> {
+        if outgoing.is_empty() {
+            return Ok(Vec::new());
+        }
+        let displays: Vec<_> = outputs.frames().collect();
+        let server_frames = self.reveal_frames(outgoing);
+        let mut planned = Vec::with_capacity(outgoing.len());
+        let mut skipped_applied = Vec::new();
+        for window in outgoing {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(ParkBatchError::Cancelled(skipped_applied));
+            }
+            if self.parking_exempt.contains(window) {
+                skipped_applied.push(window.clone());
+                continue;
+            }
+            let ax_frame = match self.backend.frame(window) {
+                Ok(frame) => frame,
+                Err(macos::WindowAccessError::Gone) => {
+                    if let Some(ws) = workspace {
+                        self.forget_window(ws, window);
+                    }
+                    continue;
+                }
+                Err(macos::WindowAccessError::Unavailable) => {
+                    return Err(ParkBatchError::Failed {
+                        window: window.clone(),
+                        outcome: macos::ApplyOutcome::Unavailable,
+                        parked: skipped_applied,
+                    });
+                }
+            };
+            let frame = match &server_frames {
+                Some(frames) => frames.get(&window.window_id).copied(),
+                None => self.backend.window_server_frame(window),
+            }
+            .unwrap_or(ax_frame);
+            let was_parked = self.parked.contains_key(window);
+            if !crate::geometry::shows_on(frame, &displays) && !was_parked {
+                log_event!("park skip: {:?} already off-screen at {:?}", window, frame);
+                skipped_applied.push(window.clone());
+                continue;
+            }
+            let original = self.parked.get(window).copied().unwrap_or(frame);
+            let park_output = Self::display_for_frame(frame, &displays).unwrap_or(output);
+            let park_size = crate::Rect {
+                width: frame.width.max(ax_frame.width),
+                height: frame.height.max(ax_frame.height),
+                ..frame
+            };
+            let target = crate::geometry::parked_frame(park_output, &displays, park_size);
+            planned.push((window.clone(), original, was_parked, target));
+        }
+
+        // Durably persist every recovery frame in one atomic write before moving
+        // any window off-screen; roll memory back if persistence fails.
+        let mut previous_entries = Vec::new();
+        for (window, original, _, _) in &planned {
+            let prev = self.parked.insert(window.clone(), *original);
+            if prev != Some(*original) {
+                previous_entries.push((window.clone(), prev));
+            }
+        }
+        if !previous_entries.is_empty()
+            && let Err(error) = self.backend.persist_parked(&self.parked)
+        {
+            let failed_window = previous_entries[0].0.clone();
+            for (window, prev) in previous_entries {
+                match prev {
+                    Some(frame) => self.parked.insert(window, frame),
+                    None => self.parked.remove(&window),
+                };
+            }
+            log_event!("failed to persist parked windows: {error}");
+            return Err(ParkBatchError::Failed {
+                window: failed_window,
+                outcome: macos::ApplyOutcome::Unavailable,
+                parked: skipped_applied,
+            });
+        }
+
+        let mut parked_outgoing = skipped_applied;
+        let mut removals = Vec::new();
+        for index in 0..planned.len() {
+            if cancelled.load(Ordering::Acquire) {
+                for (window, original, was_parked, _) in &planned[index..] {
+                    if !*was_parked && self.parked.remove(window).is_some() {
+                        removals.push((window.clone(), *original));
+                    }
+                }
+                self.persist_removals_or_rollback(removals);
+                return Err(ParkBatchError::Cancelled(parked_outgoing));
+            }
+            let (ref window, original, was_parked, target) = planned[index];
+            let outcome = self.backend.set_parked_position(window, target);
+            log_event!("park: {:?} from {:?} ({:?})", window, original, outcome);
+            match outcome {
+                macos::ApplyOutcome::Applied => {
+                    self.recently_parked.insert(window.clone(), Instant::now());
+                    parked_outgoing.push(window.clone());
+                }
+                macos::ApplyOutcome::Gone => {
+                    if !was_parked && self.parked.remove(window).is_some() {
+                        removals.push((window.clone(), original));
+                    }
+                    if let Some(ws) = workspace {
+                        self.forget_window(ws, window);
+                    }
+                }
+                other => {
+                    if !was_parked {
+                        self.restore_window_uncommitted(window);
+                        if !self.parked.contains_key(window) {
+                            removals.push((window.clone(), original));
+                        }
+                    }
+                    for (rem_window, rem_original, rem_was_parked, _) in &planned[index + 1..] {
+                        if !*rem_was_parked && self.parked.remove(rem_window).is_some() {
+                            removals.push((rem_window.clone(), *rem_original));
+                        }
+                    }
+                    self.persist_removals_or_rollback(removals);
+                    return Err(ParkBatchError::Failed {
+                        window: window.clone(),
+                        outcome: other,
+                        parked: parked_outgoing,
+                    });
+                }
+            }
+        }
+        self.persist_removals_or_rollback(removals);
+        Ok(parked_outgoing)
     }
 
     /// Park the window furthest back first. Hiding the front window first

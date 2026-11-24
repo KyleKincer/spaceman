@@ -9,7 +9,8 @@ use objc2_core_foundation::{
 };
 use objc2_core_graphics::{
     CGRectMakeWithDictionaryRepresentation, CGWindowID, CGWindowListCopyWindowInfo,
-    CGWindowListOption, kCGWindowBounds, kCGWindowLayer, kCGWindowNumber, kCGWindowOwnerPID,
+    CGWindowListCreateDescriptionFromArray, CGWindowListOption, kCGWindowBounds, kCGWindowLayer,
+    kCGWindowNumber, kCGWindowOwnerPID,
 };
 
 use crate::{AppInstanceId, PhysicalWindowId, Rect};
@@ -80,14 +81,26 @@ pub(super) fn onscreen_windows() -> Option<HashMap<i32, HashMap<CGWindowID, i64>
 /// The window server's authoritative frame for a window. Accessibility frame
 /// reads can lag behind reality for apps with asynchronous accessibility
 /// servers (Electron); Core Graphics reflects the real position immediately.
-/// The full window list is queried because the single-window variant
-/// (`kCGWindowListOptionIncludingWindow`) silently returns nothing for some
-/// applications' windows.
+/// Queries only the target window ID via `CGWindowListCreateDescriptionFromArray`
+/// (which works for both on-screen and off-screen/parked windows, unlike
+/// `kCGWindowListOptionIncludingWindow`).
 pub fn window_server_frame(id: &PhysicalWindowId) -> Option<Rect> {
-    window_server_windows(CGWindowListOption::OptionAll)?
-        .into_iter()
-        .find(|window| window.id == id.window_id && window.pid == id.app.pid)
-        .map(|window| window.frame)
+    let mut raw = ptr::without_provenance::<c_void>(id.window_id as usize);
+    // SAFETY: `CGWindowListCreateDescriptionFromArray` expects a `CFArray` whose
+    // entries are raw `CGWindowID` values (with null callbacks so Core Foundation
+    // does not treat them as retained pointers).
+    let ids = unsafe { CFArray::new(None, &raw mut raw, 1, ptr::null()) }?;
+    // SAFETY: `ids` contains a single raw `CGWindowID` value per Apple's API contract.
+    let list = unsafe { CGWindowListCreateDescriptionFromArray(Some(&ids)) }?;
+    for entry in cf_array_items::<CFDictionary>(&list) {
+        let Some((pid, window_id, _)) = window_server_identity(entry) else {
+            continue;
+        };
+        if window_id == id.window_id && pid == id.app.pid {
+            return window_server_bounds(entry);
+        }
+    }
+    None
 }
 
 /// How far outside its frame the pointer can still grab a window's edge to
@@ -147,12 +160,17 @@ pub fn window_server_frames() -> Option<HashMap<CGWindowID, Rect>> {
 
 /// On-screen window-server IDs, front-most first.
 pub fn onscreen_window_order() -> Option<Vec<CGWindowID>> {
-    Some(
-        window_server_windows(CGWindowListOption::OptionOnScreenOnly)?
-            .into_iter()
-            .map(|window| window.id)
-            .collect(),
-    )
+    let list = CGWindowListCopyWindowInfo(
+        CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements,
+        0,
+    )?;
+    let mut order = Vec::with_capacity(usize::try_from(list.count()).unwrap_or(0));
+    for entry in cf_array_items::<CFDictionary>(&list) {
+        if let Some((_, id, _)) = window_server_identity(entry) {
+            order.push(id);
+        }
+    }
+    Some(order)
 }
 
 /// Window-server frames for every ordinary window currently on screen. A
@@ -165,8 +183,8 @@ pub fn onscreen_window_frames() -> Option<HashMap<CGWindowID, Rect>> {
 pub(super) fn window_server_windows(
     options: CGWindowListOption,
 ) -> Option<Vec<WindowServerWindow>> {
-    let mut windows = Vec::new();
     let list = CGWindowListCopyWindowInfo(options | CGWindowListOption::ExcludeDesktopElements, 0)?;
+    let mut windows = Vec::with_capacity(usize::try_from(list.count()).unwrap_or(0));
     for entry in cf_array_items::<CFDictionary>(&list) {
         let Some((pid, id, _)) = window_server_identity(entry) else {
             continue;
@@ -180,12 +198,18 @@ pub(super) fn window_server_windows(
 }
 
 fn window_server_frame_map(options: CGWindowListOption) -> Option<HashMap<CGWindowID, Rect>> {
-    Some(
-        window_server_windows(options)?
-            .into_iter()
-            .map(|window| (window.id, window.frame))
-            .collect(),
-    )
+    let list = CGWindowListCopyWindowInfo(options | CGWindowListOption::ExcludeDesktopElements, 0)?;
+    let mut frames = HashMap::with_capacity(usize::try_from(list.count()).unwrap_or(0));
+    for entry in cf_array_items::<CFDictionary>(&list) {
+        let Some((_, id, _)) = window_server_identity(entry) else {
+            continue;
+        };
+        let Some(frame) = window_server_bounds(entry) else {
+            continue;
+        };
+        frames.insert(id, frame);
+    }
+    Some(frames)
 }
 
 fn window_server_identity(entry: &CFDictionary) -> Option<(i32, u32, i64)> {
